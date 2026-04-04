@@ -1,4 +1,263 @@
-const { Client, Location, Poll, List, Buttons, LocalAuth } = require('./index');
+const {
+    Client,
+    Location,
+    Poll,
+    List,
+    Buttons,
+    LocalAuth,
+    MessageMedia,
+} = require('./index');
+const fetch = require('node-fetch');
+const fs = require('fs/promises');
+const os = require('os');
+const path = require('path');
+
+let qrcode = null;
+try {
+    qrcode = require('qrcode-terminal');
+} catch {}
+
+const isHeadlessEnv = !process.env.DISPLAY;
+const botStartedAt = Date.now();
+const awaitingChecknumTxtByChat = new Set();
+const botStats = {
+    messagesReceived: 0,
+    commandsProcessed: 0,
+    repliesSent: 0,
+    broadcastsSent: 0,
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const formatUptime = (ms) => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+};
+
+const askViaDuckDuckGo = async (question) => {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(question)}&format=json&no_html=1&skip_disambig=1`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.AbstractText) return data.AbstractText;
+    if (Array.isArray(data.RelatedTopics)) {
+        const firstRelated = data.RelatedTopics.find((item) => item?.Text);
+        if (firstRelated?.Text) return firstRelated.Text;
+    }
+
+    return '我暂时没有检索到明确答案，请换个问法再试试。';
+};
+
+const normalizePhoneInput = (raw) => raw.replace(/[^0-9]/g, '');
+
+const decodeTextBuffer = (buffer) => {
+    if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+        return buffer.slice(2).toString('utf16le');
+    }
+
+    if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+        const swapped = Buffer.from(buffer.slice(2));
+        for (let i = 0; i + 1 < swapped.length; i += 2) {
+            const t = swapped[i];
+            swapped[i] = swapped[i + 1];
+            swapped[i + 1] = t;
+        }
+        return swapped.toString('utf16le');
+    }
+
+    const utf8 = buffer.toString('utf8');
+    if (utf8.includes('\u0000')) {
+        return buffer.toString('utf16le');
+    }
+    return utf8;
+};
+
+const extractNumbersFromText = (text) => {
+    const candidates = [];
+
+    const plainTokens = text.match(/[0-9]{6,18}/g) || [];
+    candidates.push(...plainTokens);
+
+    const normalizedTokenText = text.replace(/[^0-9+]+/g, ' ');
+    const plusTokens = normalizedTokenText.match(/\+?[0-9]{6,18}/g) || [];
+    candidates.push(...plusTokens);
+
+    return candidates
+        .map((item) => normalizePhoneInput(item))
+        .filter((item) => item.length >= 6 && item.length <= 18);
+};
+
+const extractPhoneNumbers = (text) => {
+    return [...new Set(extractNumbersFromText(text))];
+};
+
+const extractPhoneNumbersFromBuffer = (buffer) => {
+    const decodedTexts = [
+        decodeTextBuffer(buffer),
+        buffer.toString('utf8').replace(/\u0000/g, ''),
+        buffer.toString('utf16le').replace(/\u0000/g, ''),
+        buffer.toString('latin1').replace(/\u0000/g, ''),
+    ];
+
+    const merged = [];
+    for (const txt of decodedTexts) {
+        merged.push(...extractNumbersFromText(txt));
+    }
+
+    return [...new Set(merged)];
+};
+
+const checkActivityByWsFrames = async (clientRef, rawNumber, waitMs = 5000) => {
+    const number = normalizePhoneInput(rawNumber);
+    if (!number) {
+        return {
+            ok: false,
+            message: '号码为空或格式无效',
+        };
+    }
+
+    const cdp = await clientRef.pupPage.target().createCDPSession();
+    await cdp.send('Network.enable');
+
+    const hits = [];
+    const keywords = ['presence', 'last', 'status', 'jid', '404', 'available'];
+    const numberHints = [number, `${number}@c.us`, `${number}@s.whatsapp.net`];
+
+    const normalizeFrameText = (event) => {
+        const payload =
+            event?.response?.payloadData || event?.request?.payloadData || '';
+        if (!payload) return '';
+
+        const opcode = event?.response?.opcode ?? event?.request?.opcode;
+        if (opcode === 2) {
+            try {
+                return Buffer.from(payload, 'base64').toString('utf8').toLowerCase();
+            } catch {
+                return '';
+            }
+        }
+
+        return String(payload).toLowerCase();
+    };
+
+    const onFrame = (event) => {
+        const text = normalizeFrameText(event);
+        if (!text) return;
+        if (!keywords.some((k) => text.includes(k))) return;
+        if (!numberHints.some((hint) => text.includes(hint.toLowerCase()))) return;
+
+        hits.push(text.slice(0, 600));
+    };
+
+    cdp.on('Network.webSocketFrameReceived', onFrame);
+    cdp.on('Network.webSocketFrameSent', onFrame);
+
+    try {
+        await clientRef.pupPage.goto(
+            `https://web.whatsapp.com/send?phone=${number}`,
+            { waitUntil: 'domcontentloaded' },
+        );
+        await sleep(Math.max(waitMs, 8000));
+    } finally {
+        cdp.off('Network.webSocketFrameReceived', onFrame);
+        cdp.off('Network.webSocketFrameSent', onFrame);
+        await cdp.detach().catch(() => {});
+    }
+
+    const merged = hits.join('\n');
+    let state = 'unknown';
+    if (merged.includes('404')) state = 'unregistered';
+    else if (merged.includes('presence') && merged.includes('available'))
+        state = 'online';
+    else if (merged.includes('last')) state = 'recent_activity';
+    else if (merged.includes('status')) state = 'status_signal';
+
+    // Fallback to registration-based verdict when presence signals are absent.
+    if (state === 'unknown') {
+        try {
+            const numberId = await clientRef.getNumberId(number);
+            state = numberId ? 'registered_no_presence' : 'unregistered';
+        } catch {
+            state = 'unknown';
+        }
+    }
+
+    return {
+        ok: true,
+        number,
+        state,
+        frameCount: hits.length,
+        sample: hits[0] || '',
+    };
+};
+
+const checkNumberBehavior = async (clientRef, rawNumber, waitMs = 5000) => {
+    const number = normalizePhoneInput(rawNumber);
+    if (!number) {
+        return { ok: false, message: '号码为空或格式无效' };
+    }
+
+    try {
+        await clientRef.pupPage
+            .goto(`https://web.whatsapp.com/send?phone=${number}`, {
+                waitUntil: 'commit',
+                timeout: 15000,
+            })
+            .catch(() => {});
+
+        await sleep(waitMs);
+
+        await clientRef.pupPage
+            .evaluate(() => {
+                const link = document.querySelector('a[href*="send"]');
+                if (link) link.click();
+            })
+            .catch(() => {});
+
+        await sleep(2500);
+
+        const pageContent = (await clientRef.pupPage.content()).toLowerCase();
+        if (
+            pageContent.includes('phone number shared via url is invalid') ||
+            pageContent.includes('not on whatsapp')
+        ) {
+            return { ok: true, number, behavior: 'invalid' };
+        }
+
+        const inputExists = await clientRef.pupPage
+            .evaluate(() => {
+                const candidates = document.querySelectorAll(
+                    'div[contenteditable="true"], [role="textbox"]',
+                );
+                for (const el of candidates) {
+                    const htmlEl = /** @type {HTMLElement} */ (el);
+                    const visible =
+                        !!htmlEl &&
+                        htmlEl.offsetParent !== null &&
+                        window.getComputedStyle(htmlEl).visibility !== 'hidden';
+                    if (visible) return true;
+                }
+                return false;
+            })
+            .catch(() => false);
+
+        if (inputExists) {
+            return { ok: true, number, behavior: 'valid' };
+        }
+
+        return { ok: true, number, behavior: 'unknown' };
+    } catch (error) {
+        return {
+            ok: false,
+            number,
+            message: error?.message || String(error),
+        };
+    }
+};
 
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -16,7 +275,10 @@ const client = new Client({
     // browserName: 'Firefox',
     puppeteer: {
         // args: ['--proxy-server=proxy-server-that-requires-authentication.example.com'],
-        headless: false,
+        headless: isHeadlessEnv,
+        args: isHeadlessEnv
+            ? ['--no-sandbox', '--disable-setuid-sandbox']
+            : [],
     },
     // pairWithPhoneNumber: {
     //     phoneNumber: '96170100100' // Pair with phone number (format: <COUNTRY_CODE><PHONE_NUMBER>)
@@ -28,13 +290,28 @@ const client = new Client({
 // client initialize does not finish at ready now.
 client.initialize();
 
+console.log(
+    `Example booted (${isHeadlessEnv ? 'headless' : 'headful'} mode).`,
+);
+console.log(
+    'After READY, send "!help" to view command list, or "!ping" for a quick test.',
+);
+
 client.on('loading_screen', (percent, message) => {
     console.log('LOADING SCREEN', percent, message);
 });
 
 client.on('qr', async (qr) => {
     // NOTE: This event will not be fired if a session is specified.
-    console.log('QR RECEIVED', qr);
+    console.log('QR RECEIVED');
+    if (qrcode) {
+        qrcode.generate(qr, { small: true });
+    } else {
+        console.log(
+            'Install qrcode-terminal for in-terminal QR rendering: npm i qrcode-terminal --no-save',
+        );
+        console.log(qr);
+    }
 });
 
 client.on('code', (code) => {
@@ -65,13 +342,226 @@ client.on('ready', async () => {
 
 client.on('message', async (msg) => {
     console.log('MESSAGE RECEIVED', msg);
+    botStats.messagesReceived++;
 
-    if (msg.body === '!ping reply') {
+    if (msg.body.startsWith('!')) {
+        botStats.commandsProcessed++;
+    }
+
+    if (msg.body === '!help') {
+        await msg.reply(
+            [
+                '*可用命令*',
+                '!ping - 机器人回复 pong',
+                '!echo 文本 - 原样回显',
+                '!ask 问题 - 在线检索简要答案',
+                '!checknum - 发送后上传TXT，机器人检测并回传TXT结果',
+                '!activity 8613800138000 - 基于WebSocket帧做活跃状态探测',
+                '!behavior 8613800138000 - 模拟页面行为检测号码状态',
+                '!stats - 查看机器人运行统计',
+                '!broadcast 文本 - 广播到所有私聊会话',
+            ].join('\n'),
+        );
+        botStats.repliesSent++;
+    } else if (msg.body === '!ping reply') {
         // Send a new message as a reply to the current one
         msg.reply('pong');
     } else if (msg.body === '!ping') {
         // Send a new message to the same chat
         client.sendMessage(msg.from, 'pong');
+    } else if (msg.body.startsWith('!ask ')) {
+        const question = msg.body.slice(5).trim();
+        if (!question) {
+            await msg.reply('用法: !ask 你的问题');
+            botStats.repliesSent++;
+        } else {
+            try {
+                const answer = await askViaDuckDuckGo(question);
+                await msg.reply(`*Q:* ${question}\n*AI:* ${answer}`);
+                botStats.repliesSent++;
+            } catch (error) {
+                await msg.reply('检索失败，请稍后重试。');
+                botStats.repliesSent++;
+            }
+        }
+    } else if (msg.body.startsWith('!activity ')) {
+        const input = msg.body.slice('!activity '.length).trim();
+        const number = normalizePhoneInput(input);
+        if (!number) {
+            await msg.reply('用法: !activity 8613800138000');
+            botStats.repliesSent++;
+        } else {
+            await msg.reply('开始探测活跃状态，请稍候 3-6 秒...');
+            botStats.repliesSent++;
+            try {
+                const result = await checkActivityByWsFrames(client, number, 5000);
+                if (!result.ok) {
+                    await msg.reply(`探测失败: ${result.message}`);
+                    botStats.repliesSent++;
+                } else {
+                    await msg.reply(
+                        [
+                            `号码: ${result.number}`,
+                            `状态判定: ${result.state}`,
+                            `命中帧数: ${result.frameCount}`,
+                            `样本: ${(result.sample || '无').slice(0, 180)}`,
+                        ].join('\n'),
+                    );
+                    botStats.repliesSent++;
+                }
+            } catch (error) {
+                await msg.reply('活跃探测异常，请稍后重试。');
+                botStats.repliesSent++;
+            }
+        }
+    } else if (msg.body.startsWith('!behavior ')) {
+        const input = msg.body.slice('!behavior '.length).trim();
+        const number = normalizePhoneInput(input);
+        if (!number) {
+            await msg.reply('用法: !behavior 8613800138000');
+            botStats.repliesSent++;
+        } else {
+            await msg.reply('开始模拟页面行为检测，请稍候 6-10 秒...');
+            botStats.repliesSent++;
+            try {
+                const result = await checkNumberBehavior(client, number, 5000);
+                if (!result.ok) {
+                    await msg.reply(`行为检测失败: ${result.message}`);
+                    botStats.repliesSent++;
+                } else {
+                    await msg.reply(
+                        [
+                            `号码: ${result.number}`,
+                            `行为判定: ${result.behavior}`,
+                            '说明: valid=可进入聊天输入框, invalid=页面明确无效, unknown=无法明确判断',
+                        ].join('\n'),
+                    );
+                    botStats.repliesSent++;
+                }
+            } catch (error) {
+                await msg.reply('行为检测异常，请稍后重试。');
+                botStats.repliesSent++;
+            }
+        }
+    } else if (msg.body.startsWith('!checknum')) {
+        awaitingChecknumTxtByChat.add(msg.from);
+        await msg.reply(
+            '请发送TXT文件（每行一个号码或混排文本均可），我会自动提取号码并回传检测结果TXT。',
+        );
+        botStats.repliesSent++;
+    } else if (
+        awaitingChecknumTxtByChat.has(msg.from) &&
+        msg.hasMedia &&
+        !msg.body?.startsWith('!')
+    ) {
+        try {
+            const media = await msg.downloadMedia();
+            const filename = media?.filename || 'numbers.txt';
+            const isTxt =
+                media?.mimetype === 'text/plain' || filename.endsWith('.txt');
+
+            if (!media || !isTxt) {
+                await msg.reply('请发送TXT文件（.txt）');
+                botStats.repliesSent++;
+                return;
+            }
+
+            const fileBuffer = Buffer.from(media.data, 'base64');
+            const content = decodeTextBuffer(fileBuffer);
+            const numbers = extractPhoneNumbersFromBuffer(fileBuffer).slice(
+                0,
+                500,
+            );
+
+            if (!numbers.length) {
+                await msg.reply(
+                    [
+                        'TXT里没有识别到号码。',
+                        `文件名: ${filename}`,
+                        `MIME: ${media?.mimetype || 'unknown'}`,
+                        `字节数: ${fileBuffer.length}`,
+                        `内容预览: ${content.slice(0, 80).replace(/\s+/g, ' ')}`,
+                    ].join('\n'),
+                );
+                awaitingChecknumTxtByChat.delete(msg.from);
+                botStats.repliesSent++;
+                return;
+            }
+
+            await msg.reply(
+                `已收到文件，开始检测 ${numbers.length} 个号码，请稍候...`,
+            );
+            botStats.repliesSent++;
+
+            const rows = ['number\tstatus\twa_id'];
+            for (const number of numbers) {
+                try {
+                    const numberId = await client.getNumberId(number);
+                    const status = numberId ? 'valid' : 'invalid';
+                    const waId = numberId?._serialized || `${number}@c.us`;
+                    rows.push(`${number}\t${status}\t${waId}`);
+                } catch {
+                    rows.push(`${number}\terror\t-`);
+                }
+            }
+
+            const resultName = `checknum-result-${Date.now()}.txt`;
+            const resultPath = path.join(os.tmpdir(), resultName);
+            await fs.writeFile(resultPath, rows.join('\n'), 'utf8');
+
+            const resultMedia = MessageMedia.fromFilePath(resultPath);
+            await msg.reply(resultMedia, null, { sendMediaAsDocument: true });
+            await msg.reply(`检测完成，结果已通过TXT回传（${numbers.length}条）。`);
+            botStats.repliesSent += 2;
+
+            await fs.unlink(resultPath).catch(() => {});
+            awaitingChecknumTxtByChat.delete(msg.from);
+        } catch (error) {
+            awaitingChecknumTxtByChat.delete(msg.from);
+            await msg.reply('处理TXT失败，请重试。');
+            botStats.repliesSent++;
+        }
+    } else if (msg.body === '!stats') {
+        await msg.reply(
+            [
+                '*Bot 运行统计*',
+                `Uptime: ${formatUptime(Date.now() - botStartedAt)}`,
+                `Messages: ${botStats.messagesReceived}`,
+                `Commands: ${botStats.commandsProcessed}`,
+                `Replies: ${botStats.repliesSent}`,
+                `Broadcast messages: ${botStats.broadcastsSent}`,
+            ].join('\n'),
+        );
+        botStats.repliesSent++;
+    } else if (msg.body.startsWith('!broadcast ')) {
+        const text = msg.body.slice('!broadcast '.length).trim();
+        if (!text) {
+            await msg.reply('用法: !broadcast 你要群发的文本');
+            botStats.repliesSent++;
+        } else {
+            const chats = await client.getChats();
+            const targets = chats.filter((chat) =>
+                chat.id?._serialized?.endsWith('@c.us'),
+            );
+
+            let success = 0;
+            let failed = 0;
+
+            for (const target of targets) {
+                try {
+                    await client.sendMessage(target.id._serialized, text);
+                    success++;
+                    botStats.broadcastsSent++;
+                } catch {
+                    failed++;
+                }
+            }
+
+            await msg.reply(
+                `广播完成。成功: ${success}，失败: ${failed}，目标会话: ${targets.length}`,
+            );
+            botStats.repliesSent++;
+        }
     } else if (msg.body.startsWith('!sendto ')) {
         // Direct send a new message to specific id
         let number = msg.body.split(' ')[1];

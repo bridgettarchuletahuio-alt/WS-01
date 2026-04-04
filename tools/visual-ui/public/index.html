@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>WWebJS Visual UI</title>
+        <style>
+            :root {
+                --bg: #f4efe6;
+                --card: #fffdf9;
+                --text: #1f2a37;
+                --muted: #6b7280;
+                --ok: #1f9d55;
+                --warn: #c27803;
+                --err: #b42318;
+                --border: #e5dccf;
+                --accent: #0f766e;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                min-height: 100vh;
+                color: var(--text);
+                font-family: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+                background:
+                    radial-gradient(circle at 10% 10%, #fff6dd 0, transparent 40%),
+                    radial-gradient(circle at 90% 90%, #dff5ec 0, transparent 35%),
+                    var(--bg);
+            }
+
+            .wrap {
+                max-width: 980px;
+                margin: 0 auto;
+                padding: 24px;
+            }
+
+            .title {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 16px;
+            }
+
+            h1 {
+                margin: 0;
+                font-size: 1.5rem;
+                letter-spacing: 0.02em;
+            }
+
+            .badge {
+                border-radius: 999px;
+                padding: 6px 12px;
+                font-weight: 700;
+                background: #ece7dd;
+                color: #4b5563;
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns: 340px 1fr;
+                gap: 16px;
+            }
+
+            .card {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 12px 25px rgba(15, 23, 42, 0.06);
+            }
+
+            .qrbox {
+                min-height: 340px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border: 1px dashed #d5c9b7;
+                border-radius: 12px;
+                background: #fff;
+            }
+
+            #qr {
+                width: 320px;
+                max-width: 100%;
+            }
+
+            .muted {
+                color: var(--muted);
+                line-height: 1.5;
+                margin-top: 10px;
+            }
+
+            .logs {
+                max-height: 520px;
+                overflow: auto;
+                margin: 0;
+                padding: 12px;
+                list-style: none;
+                border-radius: 12px;
+                background: #1f2937;
+                color: #f9fafb;
+                font-family: "JetBrains Mono", monospace;
+                font-size: 13px;
+            }
+
+            .logs li {
+                padding: 4px 0;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                word-break: break-all;
+            }
+
+            .loading {
+                margin-top: 12px;
+                font-size: 14px;
+                color: #374151;
+            }
+
+            @media (max-width: 900px) {
+                .grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="title">
+                <h1>WhatsApp Bot 可视化控制台</h1>
+                <span id="status" class="badge">starting</span>
+            </div>
+
+            <div class="grid">
+                <section class="card">
+                    <div class="qrbox">
+                        <img id="qr" alt="登录二维码" hidden />
+                        <div id="qr-empty" class="muted">等待二维码...</div>
+                    </div>
+                    <div class="loading" id="loading">加载状态: -</div>
+                    <p class="muted">
+                        登录后请用另一个账号给机器人发送 !ping，若自动回复 pong 说明功能正常。
+                    </p>
+                </section>
+
+                <section class="card">
+                    <ul class="logs" id="logs"></ul>
+                </section>
+            </div>
+        </div>
+
+        <script src="/socket.io/socket.io.js"></script>
+        <script>
+            const statusEl = document.getElementById('status');
+            const qrEl = document.getElementById('qr');
+            const qrEmptyEl = document.getElementById('qr-empty');
+            const logsEl = document.getElementById('logs');
+            const loadingEl = document.getElementById('loading');
+
+            const socket = io();
+
+            const setStatusColor = (status) => {
+                if (status === 'ready') {
+                    statusEl.style.background = 'rgba(31,157,85,0.14)';
+                    statusEl.style.color = 'var(--ok)';
+                    return;
+                }
+                if (
+                    status === 'auth_failure' ||
+                    status === 'disconnected' ||
+                    status === 'crashed'
+                ) {
+                    statusEl.style.background = 'rgba(180,35,24,0.14)';
+                    statusEl.style.color = 'var(--err)';
+                    return;
+                }
+                if (status === 'waiting_for_scan') {
+                    statusEl.style.background = 'rgba(194,120,3,0.14)';
+                    statusEl.style.color = 'var(--warn)';
+                    return;
+                }
+                statusEl.style.background = 'rgba(15,118,110,0.14)';
+                statusEl.style.color = 'var(--accent)';
+            };
+
+            const pushLog = (line) => {
+                const li = document.createElement('li');
+                li.textContent = line;
+                logsEl.appendChild(li);
+                while (logsEl.children.length > 200) {
+                    logsEl.removeChild(logsEl.firstChild);
+                }
+                logsEl.scrollTop = logsEl.scrollHeight;
+            };
+
+            socket.on('status', (status) => {
+                statusEl.textContent = status;
+                setStatusColor(status);
+            });
+
+            socket.on('loading', (loading) => {
+                if (!loading) {
+                    loadingEl.textContent = '加载状态: -';
+                    return;
+                }
+                loadingEl.textContent = `加载状态: ${loading.percent}% ${loading.message}`;
+            });
+
+            socket.on('qr', (dataUrl) => {
+                if (dataUrl) {
+                    qrEl.src = dataUrl;
+                    qrEl.hidden = false;
+                    qrEmptyEl.hidden = true;
+                    return;
+                }
+                qrEl.hidden = true;
+                qrEmptyEl.hidden = false;
+            });
+
+            socket.on('logs', (logs) => {
+                logsEl.innerHTML = '';
+                logs.forEach(pushLog);
+            });
+
+            socket.on('log', (line) => pushLog(line));
+        </script>
+    </body>
+</html>
