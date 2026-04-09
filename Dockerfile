@@ -54,7 +54,6 @@ ENV PORT=3399
 ENV CHROMIUM_PATH=/usr/bin/chromium
 ENV WWEBJS_AUTH_DIR=/data/.wwebjs_auth
 
-VOLUME ["/data"]
 EXPOSE 3399
 
 CMD ["node", "tools/visual-ui/server.js"]
