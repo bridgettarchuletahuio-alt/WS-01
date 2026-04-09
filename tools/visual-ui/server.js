@@ -7,6 +7,7 @@ const os = require('os');
 const zlib = require('zlib');
 
 const express = require('express');
+const ExcelJS = require('exceljs');
 const QRCode = require('qrcode');
 const { Server } = require('socket.io');
 
@@ -34,6 +35,118 @@ const clientPool = new Map();
 let rrCursor = 0;
 
 const makeChatScopeKey = (clientId, chatId) => `${clientId}::${chatId}`;
+const AVATAR_FETCH_TIMEOUT_MS = Number(process.env.AVATAR_FETCH_TIMEOUT_MS || 12000);
+
+const detectImageExt = (mimeType = '', url = '') => {
+    const lowerMime = String(mimeType).toLowerCase();
+    if (lowerMime.includes('png')) return 'png';
+    if (lowerMime.includes('jpeg') || lowerMime.includes('jpg')) return 'jpeg';
+    if (lowerMime.includes('webp')) return 'png';
+
+    const lowerUrl = String(url).toLowerCase();
+    if (lowerUrl.includes('.png')) return 'png';
+    if (lowerUrl.includes('.jpg') || lowerUrl.includes('.jpeg')) return 'jpeg';
+    return 'png';
+};
+
+const downloadAvatarBuffer = async (avatarUrl) => {
+    if (!avatarUrl) return null;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), AVATAR_FETCH_TIMEOUT_MS);
+
+    try {
+        const resp = await fetch(avatarUrl, {
+            signal: controller.signal,
+            headers: {
+                'user-agent': 'wwebjs-visual-ui/1.0',
+            },
+        });
+
+        if (!resp.ok) return null;
+
+        const contentType = resp.headers.get('content-type') || '';
+        const arrayBuffer = await resp.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        if (!buffer.length) return null;
+
+        return {
+            buffer,
+            extension: detectImageExt(contentType, avatarUrl),
+        };
+    } catch {
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+};
+
+const buildChecknumWorkbook = async (rows) => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('checknum');
+
+    sheet.columns = [
+        { header: 'number', key: 'number', width: 18 },
+        { header: 'status', key: 'status', width: 12 },
+        { header: 'wa_id', key: 'waId', width: 24 },
+        { header: 'avatar_url', key: 'avatarUrl', width: 64 },
+        { header: 'avatar', key: 'avatar', width: 14 },
+        { header: 'note', key: 'note', width: 24 },
+    ];
+
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true };
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    const imageJobs = [];
+
+    for (const item of rows) {
+        const row = sheet.addRow({
+            number: item.number,
+            status: item.status,
+            waId: item.waId,
+            avatarUrl: item.avatarUrl || '',
+            note: item.note || '',
+        });
+
+        row.height = 64;
+
+        if (item.avatarUrl) {
+            const avatarUrlCell = row.getCell(4);
+            avatarUrlCell.value = {
+                text: item.avatarUrl,
+                hyperlink: item.avatarUrl,
+            };
+            avatarUrlCell.font = {
+                color: { argb: 'FF0563C1' },
+                underline: true,
+            };
+
+            imageJobs.push({
+                avatarUrl: item.avatarUrl,
+                rowNumber: row.number,
+            });
+        }
+    }
+
+    for (const job of imageJobs) {
+        const avatar = await downloadAvatarBuffer(job.avatarUrl);
+        if (!avatar) continue;
+
+        const imageId = workbook.addImage({
+            buffer: avatar.buffer,
+            extension: avatar.extension,
+        });
+
+        sheet.addImage(imageId, {
+            tl: { col: 4, row: job.rowNumber - 1 },
+            ext: { width: 56, height: 56 },
+            editAs: 'oneCell',
+        });
+    }
+
+    return workbook;
+};
 
 const isMostlyPrintable = (text) => {
     if (!text) return false;
@@ -812,7 +925,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                     `已收到文件，开始检测 ${numbers.length} 个号码，请稍候...`,
                 );
 
-                rows = ['number\tstatus\twa_id'];
+                const excelRows = [];
                 for (const number of numbers) {
                     try {
                         const numberId = await runWithExecutionClient(
@@ -821,12 +934,60 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                         );
                         const status = numberId ? 'valid' : 'invalid';
                         const waId = numberId?._serialized || `${number}@c.us`;
-                        rows.push(`${number}\t${status}\t${waId}`);
+
+                        let avatarUrl = '';
+                        let note = '';
+                        if (numberId?._serialized) {
+                            try {
+                                const maybeAvatar = await runWithExecutionClient(
+                                    currentClientId,
+                                    (execClient) =>
+                                        execClient.getProfilePicUrl(numberId._serialized),
+                                );
+                                avatarUrl = maybeAvatar || '';
+                                if (!avatarUrl) {
+                                    note = 'no_avatar';
+                                }
+                            } catch {
+                                note = 'avatar_fetch_failed';
+                            }
+                        } else {
+                            note = 'not_registered';
+                        }
+
+                        excelRows.push({
+                            number,
+                            status,
+                            waId,
+                            avatarUrl,
+                            note,
+                        });
                     } catch {
-                        rows.push(`${number}\terror\t-`);
+                        excelRows.push({
+                            number,
+                            status: 'error',
+                            waId: '-',
+                            avatarUrl: '',
+                            note: 'check_failed',
+                        });
                     }
                 }
-                resultName = `checknum-result-${Date.now()}.txt`;
+
+                const workbook = await buildChecknumWorkbook(excelRows);
+                resultName = `checknum-result-${Date.now()}.xlsx`;
+                const resultPath = path.join(os.tmpdir(), resultName);
+                await workbook.xlsx.writeFile(resultPath);
+
+                const resultMedia = MessageMedia.fromFilePath(resultPath);
+                await msg.reply(resultMedia, null, { sendMediaAsDocument: true });
+                await msg.reply(
+                    `检测完成，结果已通过Excel回传（${excelRows.length}条，含头像链接与头像列）。`,
+                );
+
+                await fs.unlink(resultPath).catch(() => {});
+                awaitingTxtModeByChat.delete(chatScopeKey);
+                log(`checknum Excel处理完成: ${chatId}, 共 ${excelRows.length} 个号码`);
+                return;
             }
 
             const resultPath = path.join(os.tmpdir(), resultName);
@@ -865,7 +1026,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             [
                 '*可用命令*',
                 '!ping - 回复 pong',
-                '!checknum - 先提示上传TXT，机器人批量检测并回传TXT结果',
+                '!checknum - 先提示上传TXT，机器人批量检测并回传含头像的Excel结果',
                 '!checknumlist 8613...,8526... - 批量检查号码',
                 '!activity 8613800138000 - 基于WebSocket帧做活跃状态探测',
                 '!wsdebug 8613800138000 - 导出已解码WebSocket摘要',
@@ -1145,7 +1306,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
     if (msg.body.startsWith('!checknum')) {
         awaitingTxtModeByChat.set(chatScopeKey, 'checknum');
         await msg.reply(
-            '请发送TXT文件（每行一个号码或混排文本均可），我会自动提取号码并回传检测结果TXT。',
+            '请发送TXT文件（每行一个号码或混排文本均可），我会自动提取号码并回传含头像的Excel结果。',
         );
         log(`进入TXT检测等待状态: ${currentClientId}/${chatId}`);
         return;
