@@ -12,8 +12,12 @@ const { Server } = require('socket.io');
 
 const { Client, LocalAuth, MessageMedia } = require('../../index');
 
-const PORT = Number(process.env.WWEBJS_UI_PORT || 3399);
-const HOST = '127.0.0.1';
+const PORT = Number(process.env.PORT || process.env.WWEBJS_UI_PORT || 3399);
+const HOST = process.env.HOST || '0.0.0.0';
+const AUTH_DIR = process.env.WWEBJS_AUTH_DIR
+    ? path.resolve(process.env.WWEBJS_AUTH_DIR)
+    : path.resolve(process.cwd(), '.wwebjs_auth');
+const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH;
 const CLIENT_IDS = String(process.env.WWEBJS_CLIENT_IDS || 'visual-ui')
     .split(',')
     .map((item) => item.trim())
@@ -639,12 +643,22 @@ io.on('connection', (socket) => {
     socket.emit('clients', state.clients);
 });
 const buildClient = (clientId) => {
+    const puppeteerConfig = {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+        ],
+    };
+
+    if (CHROMIUM_PATH) {
+        puppeteerConfig.executablePath = CHROMIUM_PATH;
+    }
+
     const client = new Client({
-        authStrategy: new LocalAuth({ clientId }),
-        puppeteer: {
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        },
+        authStrategy: new LocalAuth({ clientId, dataPath: AUTH_DIR }),
+        puppeteer: puppeteerConfig,
     });
 
     const entry = {
@@ -1139,8 +1153,14 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 }
 
 async function start() {
+    await fs.mkdir(AUTH_DIR, { recursive: true });
+
     server.listen(PORT, HOST, () => {
         log(`可视化页面已启动: http://${HOST}:${PORT}`);
+        log(`会话目录: ${AUTH_DIR}`);
+        if (CHROMIUM_PATH) {
+            log(`Chromium路径: ${CHROMIUM_PATH}`);
+        }
         log(`账号池已配置: ${CLIENT_IDS.join(', ')}`);
     });
 
