@@ -2652,35 +2652,68 @@ app.get('/api/admin/task-history', authRequired, async (req, res) => {
     try {
         const userId = req.query.user_id ? Number(req.query.user_id) : null;
         const mode = req.query.mode ? String(req.query.mode).trim() : null;
+        const username = req.query.username
+            ? String(req.query.username).trim()
+            : null;
+        const fromDate = req.query.from_date
+            ? String(req.query.from_date).trim()
+            : null;
+        const toDate = req.query.to_date
+            ? String(req.query.to_date).trim()
+            : null;
+        const stoppedEarly =
+            typeof req.query.stopped_early === 'string'
+                ? req.query.stopped_early.toLowerCase() === 'true'
+                : null;
+        const inputCount = req.query.input_count
+            ? Number(req.query.input_count)
+            : null;
         const limit = Math.min(Number(req.query.limit) || 100, 1000);
         const offset = Number(req.query.offset) || 0;
 
         let query =
-            'SELECT id, user_id, (SELECT username FROM app_users WHERE id = task_history.user_id) as username, mode, input_count, output_count, stopped_early, input_file_path, output_file_path, created_at FROM task_history WHERE 1=1';
+            'SELECT th.id, th.user_id, au.username, th.mode, th.input_count, th.output_count, th.stopped_early, th.input_file_path, th.output_file_path, th.created_at FROM task_history th LEFT JOIN app_users au ON au.id = th.user_id WHERE 1=1';
         const params = [];
 
         if (userId) {
-            query += ` AND user_id = $${params.length + 1}`;
+            query += ` AND th.user_id = $${params.length + 1}`;
             params.push(userId);
         }
         if (mode) {
-            query += ` AND mode = $${params.length + 1}`;
+            query += ` AND th.mode = $${params.length + 1}`;
             params.push(mode);
         }
+        if (username) {
+            query += ` AND au.username ILIKE $${params.length + 1}`;
+            params.push(`%${username}%`);
+        }
+        if (fromDate) {
+            query += ` AND th.created_at >= $${params.length + 1}`;
+            params.push(fromDate);
+        }
+        if (toDate) {
+            query += ` AND th.created_at <= $${params.length + 1}`;
+            params.push(toDate);
+        }
+        if (stoppedEarly !== null) {
+            query += ` AND th.stopped_early = $${params.length + 1}`;
+            params.push(stoppedEarly);
+        }
+        if (Number.isFinite(inputCount)) {
+            query += ` AND th.input_count = $${params.length + 1}`;
+            params.push(inputCount);
+        }
 
-        query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+        const whereSql = query.split(' WHERE ')[1];
+
+        query += ` ORDER BY th.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
         params.push(limit, offset);
 
         const result = await dbQuery(query, params);
+        const countParams = params.slice(0, params.length - 2);
         const countResult = await dbQuery(
-            `SELECT COUNT(*) as total FROM task_history WHERE 1=1 ${userId ? 'AND user_id = $1' : ''} ${mode ? (userId ? 'AND' : 'WHERE') + ' mode = $' + (userId ? 2 : 1) : ''}`,
-            userId && mode
-                ? [userId, mode]
-                : userId
-                  ? [userId]
-                  : mode
-                    ? [mode]
-                    : [],
+            `SELECT COUNT(*) as total FROM task_history th LEFT JOIN app_users au ON au.id = th.user_id WHERE ${whereSql}`,
+            countParams,
         );
 
         res.json({
