@@ -1141,6 +1141,7 @@ const resolveProfilePicWithDetail = async (
         return isLikelyPhoneDigits(m[1]);
     };
     const isLikelyLidJid = (value) => /^\d{6,24}@lid$/i.test(String(value || '').trim());
+    const rawIsLid = isLikelyLidJid(raw);
     const pushCandidate = (id) => {
         const v = String(id || '').trim();
         if (!v) return;
@@ -1153,8 +1154,9 @@ const resolveProfilePicWithDetail = async (
         pushCandidate(raw);
     }
 
-    // Only build c.us from the actual input phone number.
-    if (isLikelyPhoneDigits(normalizedFallbackNumber)) {
+    // For lid identities, do not degrade to c.us fallback.
+    // This avoids querying a mismatched identity and losing avatar hits.
+    if (!rawIsLid && isLikelyPhoneDigits(normalizedFallbackNumber)) {
         pushCandidate(`${normalizedFallbackNumber}@c.us`);
     }
 
