@@ -1014,16 +1014,31 @@ const decodeTextBuffer = (buffer) => {
 
 const extractNumbersFromText = (text) => {
     const results = [];
-    // 按行与常见列分隔符拆分，每个单元格整体剥离非数字字符
-    // 这样 "+86 138 1234 5678"、"86-138-1234-5678"、"(8613) 8888 9999"
-    // 以及包含备注字符的行都可提取到号码。
-    const tokens = String(text || '').split(/[\r\n,;|，；\t]+/);
-    for (const token of tokens) {
-        const digits = normalizePhoneInput(token);
-        if (digits.length >= 6) {
-            results.push(digits);
-        }
+    const raw = String(text || '');
+    const normalized = raw.normalize('NFKC');
+
+    // Strategy A: per-line whole extraction (best for numbers containing spaces/dashes)
+    const lines = normalized.split(/[\r\n]+/);
+    for (const line of lines) {
+        const digits = normalizePhoneInput(line);
+        if (digits.length >= 6) results.push(digits);
     }
+
+    // Strategy B: per-column extraction (for CSV/TSV lists)
+    const cells = normalized.split(/[\r\n,;|，；\t]+/);
+    for (const cell of cells) {
+        const digits = normalizePhoneInput(cell);
+        if (digits.length >= 6) results.push(digits);
+    }
+
+    // Strategy C: pattern extraction (for mixed text lines)
+    const pattern = /(?:\+?[\d\u0660-\u0669\u06f0-\u06f9][\d\u0660-\u0669\u06f0-\u06f9 \t().-]{4,}[\d\u0660-\u0669\u06f0-\u06f9])/g;
+    const matches = normalized.match(pattern) || [];
+    for (const m of matches) {
+        const digits = normalizePhoneInput(m);
+        if (digits.length >= 6) results.push(digits);
+    }
+
     return results;
 };
 
@@ -1936,6 +1951,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
     }
 
     if (!parsedNumbers.length) {
+        log(
+            `[task/parse-empty] mode=${mode} user=${req.user.username} fileContent=${fileContent ? 'yes' : 'no'} numbersType=${Array.isArray(numbers) ? 'array' : typeof numbers} numbersLen=${typeof numbers === 'string' ? numbers.length : Array.isArray(numbers) ? numbers.length : 0}`,
+        );
         res.status(400).json({ ok: false, message: '未能提取到有效电话号码。请确认每行含数字，或直接粘贴号码文本再试。' });
         return;
     }

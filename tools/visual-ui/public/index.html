@@ -1275,6 +1275,8 @@
                         errEl.textContent = '文件过大，请上传 6MB 以内的 TXT 文件';
                         return;
                     }
+                    body.fileName = file.name;
+                    body.fileSize = file.size;
                     try {
                         const arrayBuf = await file.arrayBuffer();
                         const bytes = new Uint8Array(arrayBuf);
