@@ -101,6 +101,38 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change_me_in_production';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const DAILY_DETECT_LIMIT = Number(process.env.DAILY_DETECT_LIMIT || 1000);
+const CHECKNUM_DELAY_MIN_MS = Number(
+    process.env.CHECKNUM_DELAY_MIN_MS || 800,
+);
+const CHECKNUM_DELAY_MAX_MS = Number(
+    process.env.CHECKNUM_DELAY_MAX_MS || 2200,
+);
+const CHECKNUM_BATCH_PAUSE_EVERY = Number(
+    process.env.CHECKNUM_BATCH_PAUSE_EVERY || 20,
+);
+const CHECKNUM_BATCH_PAUSE_MIN_MS = Number(
+    process.env.CHECKNUM_BATCH_PAUSE_MIN_MS || 8000,
+);
+const CHECKNUM_BATCH_PAUSE_MAX_MS = Number(
+    process.env.CHECKNUM_BATCH_PAUSE_MAX_MS || 18000,
+);
+const CHECKNUM_PROBE_COUNT = Number(process.env.CHECKNUM_PROBE_COUNT || 8);
+const CHECKNUM_QUIET_HOURS = String(
+    process.env.CHECKNUM_QUIET_HOURS || '0-7',
+);
+const CHECKNUM_QUIET_MULTIPLIER = Number(
+    process.env.CHECKNUM_QUIET_MULTIPLIER || 1.6,
+);
+const AVATAR_CACHE_TTL_MS = Number(
+    process.env.AVATAR_CACHE_TTL_MS || 172800000,
+);
+const CLIENT_COOLDOWN_MS = Number(process.env.CLIENT_COOLDOWN_MS || 3600000);
+const PROTECTED_CLIENT_IDS = new Set(
+    String(process.env.PROTECTED_CLIENT_IDS || '')
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean),
+);
 
 let dbPool = null;
 let dbReady = false;
@@ -110,6 +142,8 @@ const chatRouteCache = new Map();
 const CHAT_ROUTE_CACHE_TTL_MS = Number(
     process.env.CHAT_ROUTE_CACHE_TTL_MS || 120000,
 );
+const avatarCacheMap = new Map();
+const clientHealthMap = new Map();
 
 // userId → Set<clientId>：操作员被分配的 WA 账号绑定（内存缓存）
 const userClientMap = new Map();
@@ -163,6 +197,95 @@ const fromClientIdsText = (value) =>
         .split(',')
         .map((item) => item.trim())
         .filter((item) => CLIENT_IDS.includes(item));
+
+const randomInt = (min, max) => {
+    const a = Math.max(0, Number(min || 0));
+    const b = Math.max(a, Number(max || a));
+    return Math.floor(Math.random() * (b - a + 1)) + a;
+};
+
+const isInQuietHours = () => {
+    const m = String(CHECKNUM_QUIET_HOURS || '').match(/^(\d{1,2})-(\d{1,2})$/);
+    if (!m) return false;
+    const start = Math.max(0, Math.min(23, Number(m[1])));
+    const end = Math.max(0, Math.min(23, Number(m[2])));
+    const h = new Date().getHours();
+    if (start <= end) return h >= start && h <= end;
+    return h >= start || h <= end;
+};
+
+const getClientHealth = (clientId) => {
+    const current = clientHealthMap.get(clientId);
+    if (current) return current;
+    return {
+        score: 0.5,
+        cooldownUntil: 0,
+        updatedAt: 0,
+    };
+};
+
+const updateClientHealth = (clientId, sample = {}) => {
+    const state = getClientHealth(clientId);
+    const total = Number(sample.total || 0);
+    const avatarHits = Number(sample.avatarHits || 0);
+    const ratio = total > 0 ? avatarHits / total : state.score;
+    const nextScore = state.updatedAt
+        ? state.score * 0.7 + ratio * 0.3
+        : ratio;
+    const cooldownUntil =
+        total >= 5 && ratio < 0.05
+            ? Date.now() + CLIENT_COOLDOWN_MS
+            : state.cooldownUntil > Date.now()
+              ? state.cooldownUntil
+              : 0;
+
+    clientHealthMap.set(clientId, {
+        score: Math.max(0, Math.min(1, nextScore)),
+        cooldownUntil,
+        updatedAt: Date.now(),
+    });
+};
+
+const sortClientsByHealth = (entries) => {
+    const now = Date.now();
+    return [...entries].sort((a, b) => {
+        const ah = getClientHealth(a.clientId);
+        const bh = getClientHealth(b.clientId);
+        const aCooldown = ah.cooldownUntil > now ? 1 : 0;
+        const bCooldown = bh.cooldownUntil > now ? 1 : 0;
+        if (aCooldown !== bCooldown) return aCooldown - bCooldown;
+
+        const aProtected = PROTECTED_CLIENT_IDS.has(a.clientId) ? 1 : 0;
+        const bProtected = PROTECTED_CLIENT_IDS.has(b.clientId) ? 1 : 0;
+        if (aProtected !== bProtected) return aProtected - bProtected;
+
+        if (ah.score !== bh.score) return bh.score - ah.score;
+        return String(a.clientId).localeCompare(String(b.clientId));
+    });
+};
+
+const getAvatarCache = (number) => {
+    const key = normalizePhoneInput(number);
+    if (!key) return null;
+    const item = avatarCacheMap.get(key);
+    if (!item) return null;
+    if (Date.now() - item.ts > AVATAR_CACHE_TTL_MS) {
+        avatarCacheMap.delete(key);
+        return null;
+    }
+    return item;
+};
+
+const setAvatarCache = (number, payload) => {
+    const key = normalizePhoneInput(number);
+    if (!key) return;
+    if (!payload || !payload.avatarUrl) return;
+    avatarCacheMap.set(key, {
+        avatarUrl: payload.avatarUrl,
+        waId: payload.waId || '',
+        ts: Date.now(),
+    });
+};
 
 const issueToken = (user) => {
     return jwt.sign(
@@ -1580,7 +1703,7 @@ const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
         ...ready.slice(rrCursor % ready.length),
         ...ready.slice(0, rrCursor % ready.length),
     ];
-    const ordered = preferred
+    const orderedBase = preferred
         ? [
               preferred,
               ...rrOrdered.filter(
@@ -1588,6 +1711,7 @@ const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
               ),
           ]
         : rrOrdered;
+    const ordered = sortClientsByHealth(orderedBase);
 
     let sawRuntimeUnavailable = false;
 
@@ -1638,7 +1762,7 @@ const getTaskExecutionClients = async (
         ...ready.slice(rrCursor % ready.length),
         ...ready.slice(0, rrCursor % ready.length),
     ];
-    const ordered = preferred
+    const orderedBase = preferred
         ? [
               preferred,
               ...rrOrdered.filter(
@@ -1646,6 +1770,7 @@ const getTaskExecutionClients = async (
               ),
           ]
         : rrOrdered;
+    const ordered = sortClientsByHealth(orderedBase);
 
     const available = [];
     for (const selected of ordered) {
@@ -1742,6 +1867,7 @@ const recoverAvatarsWithBackupClients = async (
                 row.avatarUrl = avatarDetail.url;
                 row.waId = numberId._serialized;
                 row.note = `backup_avatar_ok|bot=${entry.clientId}`;
+                row.botId = entry.clientId;
                 recoveredCount += 1;
                 statsDeltaByClient[entry.clientId] =
                     Number(statsDeltaByClient[entry.clientId] || 0) + 1;
@@ -1782,11 +1908,27 @@ const dispatchNumbersAcrossClients = async (
     const statsByClient = Object.fromEntries(
         clients.map((entry) => [entry.clientId, 0]),
     );
+    const mode = String(options.mode || 'generic');
+    const pacingEnabled = mode === 'checknum';
+    const quietMultiplier = isInQuietHours()
+        ? Math.max(1, CHECKNUM_QUIET_MULTIPLIER)
+        : 1;
 
     await Promise.all(
         clients.map(async (entry, bucketIdx) => {
             for (const item of buckets[bucketIdx]) {
                 if (stopState.stopped) break;
+
+                if (pacingEnabled) {
+                    const delayMs = Math.round(
+                        randomInt(
+                            CHECKNUM_DELAY_MIN_MS,
+                            CHECKNUM_DELAY_MAX_MS,
+                        ) * quietMultiplier,
+                    );
+                    await sleep(delayMs);
+                }
+
                 try {
                     const value = await worker(
                         entry.client,
@@ -1816,6 +1958,21 @@ const dispatchNumbersAcrossClients = async (
                         error,
                         clientId: entry.clientId,
                     };
+                }
+
+                if (
+                    pacingEnabled &&
+                    CHECKNUM_BATCH_PAUSE_EVERY > 0 &&
+                    statsByClient[entry.clientId] > 0 &&
+                    statsByClient[entry.clientId] % CHECKNUM_BATCH_PAUSE_EVERY === 0
+                ) {
+                    const pauseMs = Math.round(
+                        randomInt(
+                            CHECKNUM_BATCH_PAUSE_MIN_MS,
+                            CHECKNUM_BATCH_PAUSE_MAX_MS,
+                        ) * quietMultiplier,
+                    );
+                    await sleep(pauseMs);
                 }
             }
         }),
@@ -3093,8 +3250,21 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 numbers2,
                 preferredClientId,
                 {
+                    mode: 'checknum',
                     allowedClientIds,
                     worker: async (execClient, number, workerClientId) => {
+                        const cacheHit = getAvatarCache(number);
+                        if (cacheHit?.avatarUrl) {
+                            return {
+                                number,
+                                status: 'valid',
+                                waId: cacheHit.waId || `${number}@c.us`,
+                                avatarUrl: cacheHit.avatarUrl,
+                                note: 'avatar_cache_hit',
+                                botId: workerClientId || 'cache',
+                            };
+                        }
+
                         const resolved = await resolveNumberIdWithFallback(
                             number,
                             preferredClientId,
@@ -3118,12 +3288,24 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                             avatarUrl = avatarDetail.url;
                             if (!avatarUrl) {
                                 note = `${avatarDetail.note || 'no_avatar'}|bot=${resolved.clientId || workerClientId || '-'}`;
+                            } else {
+                                setAvatarCache(number, {
+                                    avatarUrl,
+                                    waId,
+                                });
                             }
                         } else {
                             note = `not_registered|bot=${resolved.clientId || workerClientId || '-'}`;
                         }
 
-                        return { number, status, waId, avatarUrl, note };
+                        return {
+                            number,
+                            status,
+                            waId,
+                            avatarUrl,
+                            note,
+                            botId: resolved.clientId || workerClientId || '-',
+                        };
                     },
                 },
             );
@@ -3137,6 +3319,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         waId: '-',
                         avatarUrl: '',
                         note: item.error?.message || 'check_failed',
+                        botId: item.clientId || '-',
                     });
                 } else if (item.value) {
                     excelRows.push(item.value);
@@ -3168,10 +3351,29 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 preRegisteredCount > 0 &&
                 preNoAvatarCount >= preRegisteredCount;
 
+            const probeRows = excelRows.slice(
+                0,
+                Math.min(CHECKNUM_PROBE_COUNT, excelRows.length),
+            );
+            const probeNotRegisteredCount = probeRows.filter((r) =>
+                String(r.note || '').includes('not_registered'),
+            ).length;
+            const probeRegisteredCount = Math.max(
+                0,
+                probeRows.length - probeNotRegisteredCount,
+            );
+            const probeAvatarCount = probeRows.filter((r) =>
+                Boolean(r.avatarUrl),
+            ).length;
+            const probeCapabilityLimited =
+                probeRows.length >= Math.min(CHECKNUM_PROBE_COUNT, 4) &&
+                probeRegisteredCount > 0 &&
+                probeAvatarCount === 0;
+
             let backupRecoveredCount = 0;
             let backupAttemptedClientIds = [];
             let mergedStatsByClient = { ...(dispatch.statsByClient || {}) };
-            if (preCapabilityLimited) {
+            if (preCapabilityLimited || probeCapabilityLimited) {
                 const recovery = await recoverAvatarsWithBackupClients(
                     excelRows,
                     preferredClientId,
@@ -3256,6 +3458,20 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 diagnosticMessage = diagnosticMessage
                     ? `${diagnosticMessage} 备用账号补查命中 ${backupRecoveredCount} 条（尝试账号: ${fromBots}）。`
                     : `备用账号补查命中 ${backupRecoveredCount} 条（尝试账号: ${fromBots}）。`;
+            }
+
+            const healthByClient = {};
+            for (const row of validRows) {
+                const bot = String(row.botId || '');
+                if (!bot || bot === '-') continue;
+                if (!healthByClient[bot]) {
+                    healthByClient[bot] = { total: 0, avatarHits: 0 };
+                }
+                healthByClient[bot].total += 1;
+                if (row.avatarUrl) healthByClient[bot].avatarHits += 1;
+            }
+            for (const [botId, sample] of Object.entries(healthByClient)) {
+                updateClientHealth(botId, sample);
             }
 
             await addDailyProcessedCount(userId, processedCount);
