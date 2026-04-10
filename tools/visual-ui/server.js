@@ -1144,6 +1144,82 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
     };
 };
 
+const classifyAvatarFetchError = (errorText = '') => {
+    const t = String(errorText || '').toLowerCase();
+
+    if (!t) return 'unknown';
+    if (
+        /(not.?authenticated|not logged|session|target closed|execution context was destroyed|disconnected|not ready|destroyed)/.test(
+            t,
+        )
+    ) {
+        return 'session';
+    }
+    if (
+        /(timeout|timed out|etimedout|econnreset|eai_again|network|socket hang up|net::|gateway|proxy|502|503|504)/.test(
+            t,
+        )
+    ) {
+        return 'network';
+    }
+    if (/(429|too many requests|rate limit|throttl)/.test(t)) {
+        return 'rate_limit';
+    }
+    if (/(invalid wid|invalid jid|wid error|bad jid|jid)/.test(t)) {
+        return 'jid';
+    }
+    if (/(404|not found|no profile|profile pic)/.test(t)) {
+        return 'no_avatar';
+    }
+    return 'unknown';
+};
+
+const summarizeAvatarFetchFailures = (rows = []) => {
+    const byReason = {};
+    const byBot = {};
+
+    for (const row of rows) {
+        const note = String(row?.note || '');
+        if (!note.includes('avatar_fetch_failed')) continue;
+
+        const errorText = (note.match(/^avatar_fetch_failed:([^|]+)/) || [])[1] || '';
+        const bot = (note.match(/\|bot=([^|]+)/) || [])[1] || '-';
+        const reason = classifyAvatarFetchError(errorText);
+
+        byReason[reason] = Number(byReason[reason] || 0) + 1;
+        byBot[bot] = Number(byBot[bot] || 0) + 1;
+    }
+
+    const topReasonEntry = Object.entries(byReason).sort((a, b) => b[1] - a[1])[0] || [
+        'unknown',
+        0,
+    ];
+    const topBotEntry = Object.entries(byBot).sort((a, b) => b[1] - a[1])[0] || [
+        '-',
+        0,
+    ];
+
+    const reasonAdvice = {
+        session:
+            '建议优先检查机器人在线状态与会话是否失效，必要时重新扫码登录后重试。',
+        network: '建议检查该机器人网络/代理连通性，确保请求稳定后再重试。',
+        rate_limit: '建议降低并发频率，间隔一段时间后重试。',
+        jid: '建议检查号码规范化与 JID 解析结果。',
+        no_avatar: '多数属于目标无头像或隐私不可见，不是机器人故障。',
+        unknown: '建议查看服务端日志中的原始错误文本进一步定位。',
+    };
+
+    return {
+        byReason,
+        byBot,
+        topReason: topReasonEntry[0],
+        topReasonCount: Number(topReasonEntry[1] || 0),
+        topBotId: topBotEntry[0],
+        topBotCount: Number(topBotEntry[1] || 0),
+        advice: reasonAdvice[topReasonEntry[0]] || reasonAdvice.unknown,
+    };
+};
+
 const resolveNumberIdWithFallback = async (
     number,
     preferredClientId,
@@ -2755,7 +2831,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
 
             const notRegisteredCount = excelRows.filter((r) => String(r.note || '').includes('not_registered')).length;
             const noAvatarCount = excelRows.filter((r) => String(r.note || '').includes('no_avatar')).length;
-            const avatarFetchFailedCount = excelRows.filter((r) => String(r.note || '').includes('avatar_fetch_failed')).length;
+            const avatarFetchFailedRows = excelRows.filter((r) =>
+                String(r.note || '').includes('avatar_fetch_failed'),
+            );
+            const avatarFetchFailedCount = avatarFetchFailedRows.length;
+            const avatarFailureSummary = summarizeAvatarFetchFailures(
+                avatarFetchFailedRows,
+            );
             const registeredCount = Math.max(0, processedCount - notRegisteredCount);
             const avatarCapabilityLimited =
                 processedCount > 0 &&
@@ -2768,8 +2850,19 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 diagnosticMessage =
                     '当前筛选账号可查注册，但头像接口返回为空（可能是账号风控/权限限制或目标隐私设置）。';
             } else if (avatarFetchFailedCount > 0) {
+                const reasonLabels = {
+                    session: '会话/在线状态异常',
+                    network: '网络或请求超时',
+                    rate_limit: '频率限制',
+                    jid: 'JID 解析异常',
+                    no_avatar: '目标无头像或隐私不可见',
+                    unknown: '未知错误',
+                };
                 diagnosticMessage =
-                    `头像抓取接口失败 ${avatarFetchFailedCount} 条，请检查账号在线状态和网络稳定性。`;
+                    `头像抓取接口失败 ${avatarFetchFailedCount} 条，` +
+                    `主要集中在机器人 ${avatarFailureSummary.topBotId}（${avatarFailureSummary.topBotCount} 条），` +
+                    `主因：${reasonLabels[avatarFailureSummary.topReason] || '未知错误'}（${avatarFailureSummary.topReasonCount} 条）。` +
+                    avatarFailureSummary.advice;
             }
 
             await addDailyProcessedCount(userId, processedCount);
@@ -2806,6 +2899,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     noAvatarCount,
                     avatarFetchFailedCount,
                     avatarCapabilityLimited,
+                    avatarFetchFailureByReason:
+                        avatarFailureSummary.byReason,
+                    avatarFetchFailureByBot: avatarFailureSummary.byBot,
                 },
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'

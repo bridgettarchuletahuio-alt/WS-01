@@ -1559,6 +1559,38 @@
                         : String(data.message);
                 }
 
+                const failureByReason = (data.diagnostics && data.diagnostics.avatarFetchFailureByReason) || {};
+                const failureByBot = (data.diagnostics && data.diagnostics.avatarFetchFailureByBot) || {};
+                const reasonLabelMap = {
+                    session: '会话/在线',
+                    network: '网络超时',
+                    rate_limit: '频率限制',
+                    jid: 'JID异常',
+                    no_avatar: '无头像/隐私',
+                    unknown: '未知',
+                };
+                const reasonItems = Object.entries(failureByReason)
+                    .filter(([, count]) => Number(count) > 0)
+                    .sort((a, b) => Number(b[1]) - Number(a[1]))
+                    .map(([k, v]) => `${reasonLabelMap[k] || k}: ${v}条`);
+                if (reasonItems.length) {
+                    metaEl.style.display = 'block';
+                    metaEl.textContent = metaEl.textContent
+                        ? `${metaEl.textContent} ｜ 失败原因：${reasonItems.join('，')}`
+                        : `失败原因：${reasonItems.join('，')}`;
+                }
+
+                const botFailureItems = Object.entries(failureByBot)
+                    .filter(([, count]) => Number(count) > 0)
+                    .sort((a, b) => Number(b[1]) - Number(a[1]))
+                    .map(([botId, count]) => `${botId}: ${count}条`);
+                if (botFailureItems.length) {
+                    metaEl.style.display = 'block';
+                    metaEl.textContent = metaEl.textContent
+                        ? `${metaEl.textContent} ｜ 失败机器人：${botFailureItems.join('，')}`
+                        : `失败机器人：${botFailureItems.join('，')}`;
+                }
+
                 // All results are files — build blob URL and show download button
                 const contentBase64 = data.fileContent;
                 if (contentBase64) {
