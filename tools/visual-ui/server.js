@@ -958,18 +958,17 @@ const decodeTextBuffer = (buffer) => {
 };
 
 const extractNumbersFromText = (text) => {
-    const candidates = [];
-
-    const plainTokens = text.match(/[0-9]{6,18}/g) || [];
-    candidates.push(...plainTokens);
-
-    const normalizedTokenText = text.replace(/[^0-9+]+/g, ' ');
-    const plusTokens = normalizedTokenText.match(/\+?[0-9]{6,18}/g) || [];
-    candidates.push(...plusTokens);
-
-    return candidates
-        .map((item) => normalizePhoneInput(item))
-        .filter((item) => item.length >= 6 && item.length <= 18);
+    const results = [];
+    // 按行与常见列分隔符拆分，每个单元格整体剥离非数字字符
+    // 这样 "+86 138 1234 5678"、"86-138-1234-5678" 等格式均可正确提取
+    const tokens = text.split(/[\r\n,;|\t]+/);
+    for (const token of tokens) {
+        const digits = token.replace(/[^0-9]/g, '');
+        if (digits.length >= 6 && digits.length <= 18) {
+            results.push(digits);
+        }
+    }
+    return results;
 };
 
 const extractPhoneNumbers = (text) => {
@@ -1834,7 +1833,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
     } else if (Array.isArray(numbers)) {
         parsedNumbers = numbers
             .map((n) => normalizePhoneInput(String(n || '')))
-            .filter(Boolean);
+            .filter((n) => n.length >= 6 && n.length <= 18);
     } else if (typeof numbers === 'string' && numbers.trim()) {
         parsedNumbers = extractPhoneNumbers(numbers);
     }
