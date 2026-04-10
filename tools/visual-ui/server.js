@@ -50,9 +50,7 @@ const MAIN_CLIENT_ID =
     CLIENT_IDS.includes(process.env.WWEBJS_MAIN_CLIENT_ID.trim())
         ? process.env.WWEBJS_MAIN_CLIENT_ID.trim()
         : CLIENT_IDS[0];
-const MAINLESS_MODE =
-    String(process.env.WWEBJS_MAINLESS_MODE || 'false').toLowerCase() ===
-    'true';
+const MAINLESS_MODE = false;
 
 const app = express();
 const server = http.createServer(app);
