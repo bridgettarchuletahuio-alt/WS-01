@@ -79,6 +79,38 @@ let remoteSessionStore = null;
 const chatRouteCache = new Map();
 const CHAT_ROUTE_CACHE_TTL_MS = Number(process.env.CHAT_ROUTE_CACHE_TTL_MS || 120000);
 
+// userId → Set<clientId>：操作员被分配的 WA 账号绑定（内存缓存）
+const userClientMap = new Map();
+
+const reloadUserClientBindings = async () => {
+    userClientMap.clear();
+    if (!dbPool) return;
+    const res = await dbQuery(`SELECT user_id, client_id FROM user_clients`);
+    for (const row of res.rows) {
+        const uid = Number(row.user_id);
+        if (!userClientMap.has(uid)) userClientMap.set(uid, new Set());
+        userClientMap.get(uid).add(row.client_id);
+    }
+};
+
+// 返回某用户可见的 clients 视图（admin 看全部）
+const getClientsViewForUser = (userId, role) => {
+    if (role === 'admin') return state.clients;
+    const assigned = userClientMap.get(Number(userId)) || new Set();
+    const view = {};
+    for (const [cid, info] of Object.entries(state.clients)) {
+        if (assigned.has(cid)) view[cid] = info;
+    }
+    return view;
+};
+
+// 操作员是否有权操作某个 client
+const canAccessClient = (userId, role, clientId) => {
+    if (role === 'admin') return true;
+    const assigned = userClientMap.get(Number(userId)) || new Set();
+    return assigned.has(clientId);
+};
+
 const parseClientIdList = (raw) => {
     if (!raw) return [];
     if (Array.isArray(raw)) {
@@ -351,6 +383,18 @@ const initDatabase = async () => {
             CLIENT_IDS.push(row.client_id);
         }
     }
+
+    // ── user_clients：用户与 WA 账号的绑定关系 ──────────────────────────
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS user_clients (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+            client_id VARCHAR(128) NOT NULL,
+            UNIQUE(user_id, client_id)
+        )`,
+    );
+    // 加载绑定关系到内存
+    await reloadUserClientBindings();
 
     dbReady = true;
     log('PostgreSQL 已连接，注册与客户路由功能已启用。');
@@ -1176,6 +1220,15 @@ const setStatus = (status) => {
     io.emit('status', status);
 };
 
+// 向所有已认证的 socket 推送各自过滤后的 clients 视图
+const broadcastClients = () => {
+    for (const [, socket] of io.sockets.sockets) {
+        const u = socket.data?.user;
+        if (!u) continue;
+        socket.emit('clients', getClientsViewForUser(u.sub, u.role));
+    }
+};
+
 const setClientState = (clientId, patch) => {
     state.clients[clientId] = {
         ...(state.clients[clientId] || {
@@ -1185,7 +1238,7 @@ const setClientState = (clientId, patch) => {
         }),
         ...patch,
     };
-    io.emit('clients', state.clients);
+    broadcastClients();
 
     const statuses = Object.values(state.clients).map((item) => item.status);
     if (statuses.includes('ready')) {
@@ -1518,6 +1571,10 @@ app.patch('/api/users/:id', authRequired, async (req, res) => {
 
 app.post('/api/clients/:clientId/offline', authRequired, async (req, res) => {
     const { clientId } = req.params;
+    if (!canAccessClient(req.user.sub, req.user.role, clientId)) {
+        res.status(403).json({ ok: false, message: '无权限操作该账号' });
+        return;
+    }
     const entry = clientPool.get(clientId);
 
     if (!entry) {
@@ -1549,6 +1606,10 @@ app.post('/api/clients/:clientId/offline', authRequired, async (req, res) => {
 
 app.post('/api/clients/:clientId/online', authRequired, async (req, res) => {
     const { clientId } = req.params;
+    if (!canAccessClient(req.user.sub, req.user.role, clientId)) {
+        res.status(403).json({ ok: false, message: '无权限操作该账号' });
+        return;
+    }
     const oldEntry = clientPool.get(clientId);
 
     if (!CLIENT_IDS.includes(clientId)) {
@@ -1572,13 +1633,56 @@ app.post('/api/clients/:clientId/online', authRequired, async (req, res) => {
     }
 });
 
-// ── 动态添加账号（admin） ────────────────────────────────────────────────
-app.post('/api/clients', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') {
-        res.status(403).json({ ok: false, message: '无权限' });
-        return;
-    }
+// ── 用户 WA 账号绑定管理（admin）─────────────────────────────────────────
+// 查询某用户已绑定的账号列表
+app.get('/api/users/:id/clients', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') { res.status(403).json({ ok: false, message: '无权限' }); return; }
+    if (!dbReady) { dbUnavailable(res); return; }
+    const uid = Number(req.params.id);
+    const result = await dbQuery(`SELECT client_id FROM user_clients WHERE user_id = $1`, [uid]);
+    res.json({ ok: true, clientIds: result.rows.map((r) => r.client_id) });
+});
 
+// 绑定账号
+app.post('/api/users/:id/clients', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') { res.status(403).json({ ok: false, message: '无权限' }); return; }
+    if (!dbReady) { dbUnavailable(res); return; }
+    const uid = Number(req.params.id);
+    const clientId = String(req.body?.clientId || '').trim();
+    if (!clientId) { res.status(400).json({ ok: false, message: 'clientId 不能为空' }); return; }
+    try {
+        await dbQuery(
+            `INSERT INTO user_clients (user_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [uid, clientId],
+        );
+        await reloadUserClientBindings();
+        broadcastClients();
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(500).json({ ok: false, message: error?.message || '绑定失败' });
+    }
+});
+
+// 解绑账号
+app.delete('/api/users/:id/clients/:clientId', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') { res.status(403).json({ ok: false, message: '无权限' }); return; }
+    if (!dbReady) { dbUnavailable(res); return; }
+    const uid = Number(req.params.id);
+    const clientId = req.params.clientId;
+    try {
+        await dbQuery(`DELETE FROM user_clients WHERE user_id = $1 AND client_id = $2`, [uid, clientId]);
+        await reloadUserClientBindings();
+        broadcastClients();
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(500).json({ ok: false, message: error?.message || '解绑失败' });
+    }
+});
+
+// ── 动态添加账号（admin）
+
+app.post('/api/clients', authRequired, async (req, res) => {
+    // 所有已登录用户均可添加账号，账号自动绑定到创建者
     const clientId = String(req.body?.clientId || '').trim();
     if (!/^[a-zA-Z0-9_-]{2,64}$/.test(clientId)) {
         res.status(400).json({ ok: false, message: '账号ID只能包含字母/数字/下划线/横线，长度2-64' });
@@ -1596,6 +1700,12 @@ app.post('/api/clients', authRequired, async (req, res) => {
                  ON CONFLICT (client_id) DO NOTHING`,
                 [clientId],
             );
+            // 自动绑定到创建者
+            await dbQuery(
+                `INSERT INTO user_clients (user_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                [req.user.sub, clientId],
+            );
+            await reloadUserClientBindings();
         }
         if (!CLIENT_IDS.includes(clientId)) CLIENT_IDS.push(clientId);
 
@@ -1604,7 +1714,7 @@ app.post('/api/clients', authRequired, async (req, res) => {
             log(`[${clientId}] initialize 失败: ${err?.message || err}`);
         });
 
-        log(`[${clientId}] 已添加新账号，开始初始化。`);
+        log(`[${clientId}] 已由用户 ${req.user.username} 添加，开始初始化。`);
         res.json({ ok: true, clientId });
     } catch (error) {
         log(`添加账号失败: ${error?.message || error}`);
@@ -1612,16 +1722,19 @@ app.post('/api/clients', authRequired, async (req, res) => {
     }
 });
 
-// ── 动态删除账号（admin，不可删主机器人） ──────────────────────────────────
+// ── 动态删除账号（自己的账号；admin 可删所有非主机器人账号） ──────────────
 app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') {
-        res.status(403).json({ ok: false, message: '无权限' });
+    const { clientId } = req.params;
+    const isAdmin = req.user.role === 'admin';
+
+    if (clientId === MAIN_CLIENT_ID) {
+        res.status(400).json({ ok: false, message: '主机器人账号不可删除' });
         return;
     }
 
-    const { clientId } = req.params;
-    if (clientId === MAIN_CLIENT_ID) {
-        res.status(400).json({ ok: false, message: '主机器人账号不可删除' });
+    // 非 admin 只能删自己绑定的账号
+    if (!isAdmin && !canAccessClient(req.user.sub, req.user.role, clientId)) {
+        res.status(403).json({ ok: false, message: '无权限删除该账号' });
         return;
     }
 
@@ -1639,14 +1752,16 @@ app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
 
         if (dbReady) {
             await dbQuery(`DELETE FROM managed_clients WHERE client_id = $1`, [clientId]);
+            // user_clients 通过 ON DELETE CASCADE 自动清理
         }
+        await reloadUserClientBindings();
 
         const newClients = { ...state.clients };
         delete newClients[clientId];
         state.clients = newClients;
-        io.emit('clients', state.clients);
+        broadcastClients();
 
-        log(`[${clientId}] 账号已删除。`);
+        log(`[${clientId}] 账号已由 ${req.user.username} 删除。`);
         res.json({ ok: true });
     } catch (error) {
         log(`删除账号失败: ${error?.message || error}`);
@@ -1654,12 +1769,28 @@ app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
     }
 });
 
+// Socket.IO 认证中间件
+io.use((socket, next) => {
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token || '';
+    if (!token) {
+        // 未认证仍允许连接，但 data.user 为空（只收到公共事件）
+        return next();
+    }
+    try {
+        socket.data.user = jwt.verify(token, JWT_SECRET);
+    } catch {
+        // token 无效时不报错，只当匿名
+    }
+    next();
+});
+
 io.on('connection', (socket) => {
+    const u = socket.data?.user;
     socket.emit('status', state.status);
     socket.emit('loading', state.loading);
     socket.emit('qr', state.qrDataUrl);
     socket.emit('logs', state.logs);
-    socket.emit('clients', state.clients);
+    socket.emit('clients', u ? getClientsViewForUser(u.sub, u.role) : {});
     socket.emit('role', state.role);
 });
 const buildClient = (clientId) => {

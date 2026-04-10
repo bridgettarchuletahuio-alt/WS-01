@@ -447,6 +447,7 @@
                                 <th>角色</th>
                                 <th>已审批</th>
                                 <th>注册时间</th>
+                                <th>分配账号</th>
                             </tr>
                         </thead>
                         <tbody id="users-body"></tbody>
@@ -483,7 +484,7 @@
             const confirmAddClientBtn = document.getElementById('confirm-add-client-btn');
             const cancelAddClientBtn = document.getElementById('cancel-add-client-btn');
 
-            const socket = io();
+            const socket = io({ auth: { token: localStorage.getItem(tokenKey) || '' } });
             let clientsState = {};
             let roleState = { mainClientId: null };
             let availableRouteClients = [];
@@ -543,9 +544,10 @@
                     const data = await resp.json();
                     currentUser = data.user;
                     userBadgeEl.textContent = `${data.user.username} (${data.user.role})`;
+                    // 所有用户均可添加账号
+                    showAddClientBtn.style.display = '';
                     if (data.user.role === 'admin') {
                         document.getElementById('user-mgmt-section').classList.add('visible');
-                        showAddClientBtn.style.display = '';
                         await loadUsers();
                     }
                     return true;
@@ -607,12 +609,94 @@
                     const dateTd = document.createElement('td');
                     dateTd.textContent = createdDate;
 
+                    // 分配账号按钮（只对 operator 有意义）
+                    const assignTd = document.createElement('td');
+                    if (!isSelf) {
+                        const assignBtn = document.createElement('button');
+                        assignBtn.className = 'btn';
+                        assignBtn.style.fontSize = '12px';
+                        assignBtn.textContent = '分配账号';
+                        assignBtn.addEventListener('click', () => openAssignPanel(u, assignBtn));
+                        assignTd.appendChild(assignBtn);
+                    }
+
                     tr.appendChild(nameTd);
                     tr.appendChild(roleTd);
                     tr.appendChild(approvedTd);
                     tr.appendChild(dateTd);
+                    tr.appendChild(assignTd);
                     tbody.appendChild(tr);
+
+                    // 展开行（分配账号面板，默认隐藏）
+                    const panelTr = document.createElement('tr');
+                    panelTr.id = `assign-panel-${u.id}`;
+                    panelTr.style.display = 'none';
+                    const panelTd = document.createElement('td');
+                    panelTd.colSpan = 5;
+                    panelTd.style.padding = '6px 12px 12px';
+                    panelTd.style.background = '#f9f6f0';
+                    panelTd.innerHTML = '<span class="muted" style="font-size:12px">加载中...</span>';
+                    panelTr.appendChild(panelTd);
+                    tbody.appendChild(panelTr);
                 });
+            };
+
+            let assignPanelOpen = null;
+
+            const openAssignPanel = async (u, btn) => {
+                const panelTr = document.getElementById(`assign-panel-${u.id}`);
+                if (!panelTr) return;
+                if (assignPanelOpen === u.id) {
+                    panelTr.style.display = 'none';
+                    assignPanelOpen = null;
+                    return;
+                }
+                if (assignPanelOpen !== null) {
+                    const prevPanel = document.getElementById(`assign-panel-${assignPanelOpen}`);
+                    if (prevPanel) prevPanel.style.display = 'none';
+                }
+                assignPanelOpen = u.id;
+                panelTr.style.display = '';
+                await renderAssignPanel(u.id, panelTr.firstChild);
+            };
+
+            const renderAssignPanel = async (userId, td) => {
+                const resp = await authFetch(`/api/users/${userId}/clients`, { method: 'GET' });
+                const data = await resp.json().catch(() => ({ ok: false, clientIds: [] }));
+                const assigned = new Set(data.clientIds || []);
+                const allClients = Object.keys(clientsState);
+
+                td.innerHTML = '<b style="font-size:12px">分配 WA 账号（操作员只可见已分配的账号）</b><br>';
+
+                if (!allClients.length) {
+                    td.innerHTML += '<span class="muted" style="font-size:12px">暂无账号</span>';
+                    return;
+                }
+
+                const flex = document.createElement('div');
+                flex.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px';
+
+                allClients.forEach((cid) => {
+                    const isAssigned = assigned.has(cid);
+                    const pill = document.createElement('button');
+                    pill.className = 'btn';
+                    pill.style.cssText = `font-size:12px;padding:3px 10px;${isAssigned ? 'background:#0f766e;color:#fff;border-color:#0f766e' : ''}`;
+                    pill.textContent = `${cid}${isAssigned ? ' ✓' : ''}`;
+                    pill.addEventListener('click', async () => {
+                        if (isAssigned) {
+                            await authFetch(`/api/users/${userId}/clients/${encodeURIComponent(cid)}`, { method: 'DELETE' });
+                        } else {
+                            await authFetch(`/api/users/${userId}/clients`, {
+                                method: 'POST',
+                                body: JSON.stringify({ clientId: cid }),
+                            });
+                        }
+                        await renderAssignPanel(userId, td);
+                    });
+                    flex.appendChild(pill);
+                });
+
+                td.appendChild(flex);
             };
 
             const loadUsers = async () => {
@@ -700,8 +784,8 @@
                     actions.appendChild(onlineBtn);
                     actions.appendChild(offlineBtn);
 
-                    // 仅 admin 且非主机器人显示删除按钮
-                    if (currentUser?.role === 'admin' && clientId !== roleState.mainClientId) {
+                    // 非主机器人，且账号在自己视图里（即自己的账号）就可删除
+                    if (clientId !== roleState.mainClientId) {
                         const deleteBtn = document.createElement('button');
                         deleteBtn.className = 'btn btn-danger';
                         deleteBtn.textContent = '删除账号';
