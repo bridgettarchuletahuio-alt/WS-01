@@ -50,6 +50,9 @@ const MAIN_CLIENT_ID =
     CLIENT_IDS.includes(process.env.WWEBJS_MAIN_CLIENT_ID.trim())
         ? process.env.WWEBJS_MAIN_CLIENT_ID.trim()
         : CLIENT_IDS[0];
+const MAINLESS_MODE =
+    String(process.env.WWEBJS_MAINLESS_MODE || 'false').toLowerCase() ===
+    'true';
 
 const app = express();
 const server = http.createServer(app);
@@ -1066,7 +1069,7 @@ const getReadyFilterClients = (allowedClientIds = null) => {
             ? new Set(allowedClientIds)
             : null;
     return getReadyClients().filter((entry) => {
-        if (entry.clientId === MAIN_CLIENT_ID) return false;
+        if (!MAINLESS_MODE && entry.clientId === MAIN_CLIENT_ID) return false;
         if (!allowSet) return true;
         return allowSet.has(entry.clientId);
     });
@@ -1082,6 +1085,10 @@ const buildClientJid = (entry) => {
 };
 
 const ensureMainFilterLink = async (filterEntry) => {
+    if (MAINLESS_MODE) {
+        return { ok: true, reason: '' };
+    }
+
     const cacheKey = filterEntry.clientId;
     const cached = contactGuardCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < CONTACT_GUARD_CACHE_TTL_MS) {
@@ -1192,7 +1199,9 @@ const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
     }
 
     throw new Error(
-        '暂无符合条件的筛选账号：请确保筛选账号在线，且主机器人与筛选账号可互通',
+        MAINLESS_MODE
+            ? '暂无符合条件的工作账号：请确保至少有一个账号在线可用'
+            : '暂无符合条件的筛选账号：请确保筛选账号在线，且主机器人与筛选账号可互通',
     );
 };
 
@@ -1229,7 +1238,9 @@ const getTaskExecutionClients = async (
 
     if (!available.length) {
         throw new Error(
-            '暂无符合条件的筛选账号：请确保筛选账号在线，且主机器人与筛选账号可互通',
+            MAINLESS_MODE
+                ? '暂无符合条件的工作账号：请确保至少有一个账号在线可用'
+                : '暂无符合条件的筛选账号：请确保筛选账号在线，且主机器人与筛选账号可互通',
         );
     }
 
@@ -1666,7 +1677,8 @@ const state = {
     logs: [],
     clients: {},
     role: {
-        mainClientId: MAIN_CLIENT_ID,
+        mainClientId: MAINLESS_MODE ? null : MAIN_CLIENT_ID,
+        mainlessMode: MAINLESS_MODE,
     },
 };
 
@@ -1875,9 +1887,9 @@ app.get('/api/routes', authRequired, async (req, res) => {
         res.json({
             ok: true,
             items,
-            availableClientIds: CLIENT_IDS.filter(
-                (id) => id !== MAIN_CLIENT_ID,
-            ),
+            availableClientIds: MAINLESS_MODE
+                ? [...CLIENT_IDS]
+                : CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID),
         });
     } catch (error) {
         log(`routes 查询失败: ${error?.message || error}`);
@@ -1894,7 +1906,7 @@ app.post('/api/routes', authRequired, async (req, res) => {
     const chatId = String(req.body?.chatId || '').trim();
     const demandTag = String(req.body?.demandTag || '').trim();
     const clientIds = parseClientIdList(req.body?.clientIds).filter(
-        (id) => id !== MAIN_CLIENT_ID,
+        (id) => MAINLESS_MODE || id !== MAIN_CLIENT_ID,
     );
 
     if (!chatId || !demandTag) {
@@ -2315,12 +2327,12 @@ app.post('/api/clients', authRequired, async (req, res) => {
     }
 });
 
-// ── 动态删除账号（自己的账号；admin 可删所有非主机器人账号） ──────────────
+// ── 动态删除账号（无主模式下所有账号均可删除；有主模式保留主机器人） ─────
 app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
     const { clientId } = req.params;
     const isAdmin = req.user.role === 'admin';
 
-    if (clientId === MAIN_CLIENT_ID) {
+    if (!MAINLESS_MODE && clientId === MAIN_CLIENT_ID) {
         res.status(400).json({ ok: false, message: '主机器人账号不可删除' });
         return;
     }
@@ -3460,7 +3472,7 @@ const buildClient = (clientId) => {
     setClientState(clientId, { status: 'starting' });
 
     client.on('loading_screen', (percent, message) => {
-        if (clientId === MAIN_CLIENT_ID) {
+        if (!MAINLESS_MODE && clientId === MAIN_CLIENT_ID) {
             state.loading = { percent, message };
             io.emit('loading', state.loading);
         }
@@ -3471,7 +3483,7 @@ const buildClient = (clientId) => {
         entry.status = 'waiting_for_scan';
         setClientState(clientId, { status: 'waiting_for_scan' });
         const qrDataUrl = await QRCode.toDataURL(qr, { width: 320, margin: 1 });
-        if (clientId === MAIN_CLIENT_ID) {
+        if (!MAINLESS_MODE && clientId === MAIN_CLIENT_ID) {
             state.qrDataUrl = qrDataUrl;
             io.emit('qr', state.qrDataUrl);
         }
@@ -3481,7 +3493,7 @@ const buildClient = (clientId) => {
 
     client.on('authenticated', () => {
         entry.status = 'authenticated';
-        if (clientId === MAIN_CLIENT_ID) {
+        if (!MAINLESS_MODE && clientId === MAIN_CLIENT_ID) {
             state.qrDataUrl = null;
             io.emit('qr', null);
         }
@@ -3514,7 +3526,7 @@ const buildClient = (clientId) => {
         log(`[${clientId}] 连接断开: ${reason}`);
     });
 
-    if (clientId === MAIN_CLIENT_ID) {
+    if (MAINLESS_MODE || clientId === MAIN_CLIENT_ID) {
         client.on('message', (msg) =>
             handleCommandMessage(msg, client, clientId),
         );
@@ -4115,12 +4127,17 @@ async function start() {
         if (CHROMIUM_PATH) {
             log(`Chromium路径: ${CHROMIUM_PATH}`);
         }
-        const filterIds = CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID);
         log(`账号池已配置: ${CLIENT_IDS.join(', ')}`);
-        log(`主机器人账号: ${MAIN_CLIENT_ID}`);
-        log(
-            `筛选账号: ${filterIds.length ? filterIds.join(', ') : '(未配置)'}`,
-        );
+        if (MAINLESS_MODE) {
+            log('运行模式: 无主模式');
+            log(`工作账号: ${CLIENT_IDS.length ? CLIENT_IDS.join(', ') : '(未配置)'}`);
+        } else {
+            const filterIds = CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID);
+            log(`主机器人账号: ${MAIN_CLIENT_ID}`);
+            log(
+                `筛选账号: ${filterIds.length ? filterIds.join(', ') : '(未配置)'}`,
+            );
+        }
     });
 
     for (const clientId of CLIENT_IDS) {

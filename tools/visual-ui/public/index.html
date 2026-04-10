@@ -683,7 +683,7 @@
 
             const socket = io({ auth: { token: localStorage.getItem(tokenKey) || '' } });
             let clientsState = {};
-            let roleState = { mainClientId: null };
+            let roleState = { mainClientId: null, mainlessMode: false };
             let availableRouteClients = [];
             let currentUser = null;
 
@@ -841,7 +841,9 @@
 
             const renderRouteClientChoices = () => {
                 clientChipsEl.innerHTML = '';
-                const list = availableRouteClients.filter((id) => id !== roleState.mainClientId);
+                const list = roleState.mainlessMode
+                    ? availableRouteClients
+                    : availableRouteClients.filter((id) => id !== roleState.mainClientId);
                 if (!list.length) {
                     const span = document.createElement('span');
                     span.className = 'muted';
@@ -1115,8 +1117,11 @@
 
                     const roleEl = document.createElement('span');
                     roleEl.className = 'client-role';
-                    roleEl.textContent =
-                        clientId === roleState.mainClientId ? '主机器人' : '筛选账号';
+                                        roleEl.textContent = roleState.mainlessMode
+                                                ? '工作账号'
+                                                : clientId === roleState.mainClientId
+                                                    ? '主机器人'
+                                                    : '筛选账号';
 
                     top.appendChild(idEl);
                     top.appendChild(roleEl);
@@ -1143,8 +1148,8 @@
                     actions.appendChild(onlineBtn);
                     actions.appendChild(offlineBtn);
 
-                    // 非主机器人，且账号在自己视图里（即自己的账号）就可删除
-                    if (clientId !== roleState.mainClientId) {
+                    // 无主模式下所有账号可删；有主模式保留主机器人
+                    if (roleState.mainlessMode || clientId !== roleState.mainClientId) {
                         const deleteBtn = document.createElement('button');
                         deleteBtn.className = 'btn btn-danger';
                         deleteBtn.textContent = '删除账号';
@@ -1348,7 +1353,7 @@
             });
 
             socket.on('role', (role) => {
-                roleState = role || { mainClientId: null };
+                roleState = role || { mainClientId: null, mainlessMode: false };
                 renderClients();
                 renderRouteClientChoices();
             });
