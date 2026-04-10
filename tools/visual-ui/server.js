@@ -1062,26 +1062,43 @@ const resolveNumberIdWithFallback = async (
     allowedClientIds = null,
     primaryClient = null,
 ) => {
-    if (!number) return null;
+    if (!number) {
+        return { numberId: null, clientRef: null, clientId: '' };
+    }
 
     if (primaryClient) {
         try {
             const value = await resolveNumberId(primaryClient, number);
-            if (value) return value;
+            if (value) {
+                return {
+                    numberId: value,
+                    clientRef: primaryClient,
+                    clientId: preferredClientId || '',
+                };
+            }
         } catch {
             // fallback to other ready clients below
         }
     }
 
     try {
-        const value = await runWithExecutionClient(
+        const resolved = await runWithExecutionClient(
             preferredClientId,
-            (execClient) => resolveNumberId(execClient, number),
+            async (execClient, execClientId) => {
+                const value = await resolveNumberId(execClient, number);
+                return {
+                    numberId: value || null,
+                    clientRef: value ? execClient : null,
+                    clientId: value ? execClientId : '',
+                };
+            },
             { allowedClientIds },
         );
-        return value || null;
+        return (
+            resolved || { numberId: null, clientRef: null, clientId: '' }
+        );
     } catch {
-        return null;
+        return { numberId: null, clientRef: null, clientId: '' };
     }
 };
 
@@ -2595,12 +2612,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 {
                     allowedClientIds,
                     worker: async (execClient, number) => {
-                        const numberId = await resolveNumberIdWithFallback(
+                        const resolved = await resolveNumberIdWithFallback(
                             number,
                             preferredClientId,
                             allowedClientIds,
                             execClient,
                         );
+                        const numberId = resolved.numberId;
                         const status = numberId ? 'valid' : 'invalid';
                         const waId = numberId?._serialized || `${number}@c.us`;
 
@@ -2611,7 +2629,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                                 numberId._serialized,
                                 preferredClientId,
                                 allowedClientIds,
-                                execClient,
+                                resolved.clientRef || execClient,
                             );
                             if (!avatarUrl) note = 'no_avatar';
                         } else {
