@@ -1196,6 +1196,116 @@ const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
     );
 };
 
+const getTaskExecutionClients = async (
+    preferredClientId,
+    allowedClientIds = null,
+) => {
+    const ready = getReadyFilterClients(allowedClientIds);
+    if (!ready.length) {
+        throw new Error('暂无可用筛选账号，请先登录其他WS账号作为筛选账号');
+    }
+
+    const preferred = ready.find(
+        (entry) => entry.clientId === preferredClientId,
+    );
+    const rrOrdered = [
+        ...ready.slice(rrCursor % ready.length),
+        ...ready.slice(0, rrCursor % ready.length),
+    ];
+    const ordered = preferred
+        ? [
+              preferred,
+              ...rrOrdered.filter(
+                  (item) => item.clientId !== preferred.clientId,
+              ),
+          ]
+        : rrOrdered;
+
+    const available = [];
+    for (const selected of ordered) {
+        const guard = await ensureMainFilterLink(selected);
+        if (guard.ok) available.push(selected);
+    }
+
+    if (!available.length) {
+        throw new Error(
+            '暂无符合条件的筛选账号：请确保筛选账号在线，且主机器人与筛选账号可互通',
+        );
+    }
+
+    rrCursor = (rrCursor + available.length) % Math.max(ready.length, 1);
+    return available;
+};
+
+const dispatchNumbersAcrossClients = async (
+    numbers,
+    preferredClientId,
+    options = {},
+) => {
+    const worker = options.worker;
+    if (typeof worker !== 'function') {
+        throw new Error('dispatch worker 未提供');
+    }
+
+    const clients = await getTaskExecutionClients(
+        preferredClientId,
+        options.allowedClientIds || null,
+    );
+
+    const buckets = clients.map(() => []);
+    numbers.forEach((number, idx) => {
+        buckets[idx % clients.length].push({ number, idx });
+    });
+
+    const output = new Array(numbers.length);
+    const stopState = { stopped: false, reason: '' };
+
+    await Promise.all(
+        clients.map(async (entry, bucketIdx) => {
+            for (const item of buckets[bucketIdx]) {
+                if (stopState.stopped) break;
+                try {
+                    const value = await worker(
+                        entry.client,
+                        item.number,
+                        entry.clientId,
+                    );
+                    output[item.idx] = {
+                        number: item.number,
+                        value,
+                        error: null,
+                        clientId: entry.clientId,
+                    };
+                } catch (error) {
+                    if (isDispatchUnavailableError(error)) {
+                        stopState.stopped = true;
+                        stopState.reason = String(error?.message || error);
+                        break;
+                    }
+                    if (isExecutionClientUnavailableError(error)) {
+                        contactGuardCache.delete(entry.clientId);
+                    }
+                    output[item.idx] = {
+                        number: item.number,
+                        value: null,
+                        error,
+                        clientId: entry.clientId,
+                    };
+                }
+            }
+        }),
+    );
+
+    const results = output.filter(Boolean);
+    return {
+        clients,
+        results,
+        stoppedEarly: stopState.stopped,
+        stopMessage: stopState.reason,
+        unprocessedCount: Math.max(0, numbers.length - results.length),
+    };
+};
+
 const isExecutionClientUnavailableError = (error) => {
     const message = String(error?.message || error || '').toLowerCase();
     return (
@@ -2403,51 +2513,50 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const numbers2 = parsedNumbers;
             const excelRows = [];
             let stoppedEarly = false;
+            const dispatch = await dispatchNumbersAcrossClients(
+                numbers2,
+                preferredClientId,
+                {
+                    allowedClientIds,
+                    worker: async (execClient, number) => {
+                        const numberId = await resolveNumberId(execClient, number);
+                        const status = numberId ? 'valid' : 'invalid';
+                        const waId = numberId?._serialized || `${number}@c.us`;
 
-            for (const number of numbers2) {
-                try {
-                    const numberId = await runWithExecutionClient(
-                        preferredClientId,
-                        (execClient) => resolveNumberId(execClient, number),
-                        { allowedClientIds },
-                    );
-                    const status = numberId ? 'valid' : 'invalid';
-                    const waId = numberId?._serialized || `${number}@c.us`;
-
-                    let avatarUrl = '';
-                    let note = '';
-                    if (numberId?._serialized) {
-                        try {
-                            const maybeAvatar = await runWithExecutionClient(
-                                preferredClientId,
-                                (execClient) =>
-                                    execClient.getProfilePicUrl(
+                        let avatarUrl = '';
+                        let note = '';
+                        if (numberId?._serialized) {
+                            try {
+                                const maybeAvatar =
+                                    await execClient.getProfilePicUrl(
                                         numberId._serialized,
-                                    ),
-                                { allowedClientIds },
-                            );
-                            avatarUrl = maybeAvatar || '';
-                            if (!avatarUrl) note = 'no_avatar';
-                        } catch {
-                            note = 'avatar_fetch_failed';
+                                    );
+                                avatarUrl = maybeAvatar || '';
+                                if (!avatarUrl) note = 'no_avatar';
+                            } catch {
+                                note = 'avatar_fetch_failed';
+                            }
+                        } else {
+                            note = 'not_registered';
                         }
-                    } else {
-                        note = 'not_registered';
-                    }
 
-                    excelRows.push({ number, status, waId, avatarUrl, note });
-                } catch (error) {
-                    if (isDispatchUnavailableError(error)) {
-                        stoppedEarly = true;
-                        break;
-                    }
+                        return { number, status, waId, avatarUrl, note };
+                    },
+                },
+            );
+
+            stoppedEarly = dispatch.stoppedEarly;
+            for (const item of dispatch.results) {
+                if (item.error) {
                     excelRows.push({
-                        number,
+                        number: item.number,
                         status: 'error',
                         waId: '-',
                         avatarUrl: '',
-                        note: error?.message || 'check_failed',
+                        note: item.error?.message || 'check_failed',
                     });
+                } else if (item.value) {
+                    excelRows.push(item.value);
                 }
             }
 
@@ -2491,7 +2600,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
                 message: finalStoppedEarly
-                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
                 fileContent: Buffer.from(buffer).toString('base64'),
                 filename: filename,
@@ -2503,23 +2612,25 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const rows = ['number\tactivity\tack\tchannel\tnote'];
             let stoppedEarly = false;
 
-            for (const number of numbers2) {
-                try {
-                    const result = await runWithExecutionClient(
-                        preferredClientId,
-                        (execClient) =>
-                            runProbeForNumber(execClient, number, PROBE_TEXT),
-                        { allowedClientIds },
-                    );
+            const dispatch = await dispatchNumbersAcrossClients(
+                numbers2,
+                preferredClientId,
+                {
+                    allowedClientIds,
+                    worker: async (execClient, number) =>
+                        runProbeForNumber(execClient, number, PROBE_TEXT),
+                },
+            );
+
+            stoppedEarly = dispatch.stoppedEarly;
+            for (const item of dispatch.results) {
+                if (item.error) {
+                    rows.push(`${item.number}\terror\t-\t-\tprobe_failed`);
+                } else if (item.value) {
+                    const result = item.value;
                     rows.push(
                         `${result.number}\t${result.activity}\t${result.ack === null ? 'timeout' : result.ack}\t${result.source}\t${result.note || '-'}`,
                     );
-                } catch (error) {
-                    if (isDispatchUnavailableError(error)) {
-                        stoppedEarly = true;
-                        break;
-                    }
-                    rows.push(`${number}\terror\t-\t-\tprobe_failed`);
                 }
             }
 
@@ -2576,7 +2687,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
                 message: finalStoppedEarly
-                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
@@ -2587,24 +2698,27 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const resultLines = [];
             let stoppedEarly = false;
 
-            for (const number of numbers2) {
-                try {
-                    const numberId = await runWithExecutionClient(
-                        preferredClientId,
-                        (execClient) => resolveNumberId(execClient, number),
-                        { allowedClientIds },
+            const dispatch = await dispatchNumbersAcrossClients(
+                numbers2,
+                preferredClientId,
+                {
+                    allowedClientIds,
+                    worker: async (execClient, number) =>
+                        resolveNumberId(execClient, number),
+                },
+            );
+
+            stoppedEarly = dispatch.stoppedEarly;
+            for (const item of dispatch.results) {
+                if (item.error) {
+                    resultLines.push(
+                        `${item.number}\terror\t${item.error?.message || 'failed'}`,
                     );
+                } else {
+                    const numberId = item.value;
                     const waId = numberId?._serialized || '';
                     resultLines.push(
-                        `${number}\t${numberId ? 'registered' : 'unregistered'}\t${waId}`,
-                    );
-                } catch (error) {
-                    if (isDispatchUnavailableError(error)) {
-                        stoppedEarly = true;
-                        break;
-                    }
-                    resultLines.push(
-                        `${number}\terror\t${error?.message || 'failed'}`,
+                        `${item.number}\t${numberId ? 'registered' : 'unregistered'}\t${waId}`,
                     );
                 }
             }
@@ -2661,7 +2775,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
                 message: finalStoppedEarly
-                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
@@ -2672,24 +2786,26 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const resultLines = [];
             let stoppedEarly = false;
 
-            for (const number of numbers2) {
-                try {
-                    const r = await runWithExecutionClient(
-                        preferredClientId,
-                        (execClient) =>
-                            checkActivityByWsFrames(execClient, number, 5000),
-                        { allowedClientIds },
+            const dispatch = await dispatchNumbersAcrossClients(
+                numbers2,
+                preferredClientId,
+                {
+                    allowedClientIds,
+                    worker: async (execClient, number) =>
+                        checkActivityByWsFrames(execClient, number, 5000),
+                },
+            );
+
+            stoppedEarly = dispatch.stoppedEarly;
+            for (const item of dispatch.results) {
+                if (item.error) {
+                    resultLines.push(
+                        `${item.number}\terror\t${item.error?.message || 'failed'}`,
                     );
+                } else if (item.value) {
+                    const r = item.value;
                     resultLines.push(
                         `${r.number}\t${r.state}\tframes=${r.frameCount}\tkeyword=${r.keywordHits}\tsvc=${r.serviceHits}\t${r.sample ? r.sample.slice(0, 100) : '-'}`,
-                    );
-                } catch (error) {
-                    if (isDispatchUnavailableError(error)) {
-                        stoppedEarly = true;
-                        break;
-                    }
-                    resultLines.push(
-                        `${number}\terror\t${error?.message || 'failed'}`,
                     );
                 }
             }
@@ -2755,7 +2871,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
                 message: finalStoppedEarly
-                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
@@ -2822,24 +2938,26 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const resultLines = [];
             let stoppedEarly = false;
 
-            for (const number of numbers2) {
-                try {
-                    const r = await runWithExecutionClient(
-                        preferredClientId,
-                        (execClient) =>
-                            checkNumberBehavior(execClient, number, 5000),
-                        { allowedClientIds },
-                    );
+            const dispatch = await dispatchNumbersAcrossClients(
+                numbers2,
+                preferredClientId,
+                {
+                    allowedClientIds,
+                    worker: async (execClient, number) =>
+                        checkNumberBehavior(execClient, number, 5000),
+                },
+            );
+
+            stoppedEarly = dispatch.stoppedEarly;
+            for (const item of dispatch.results) {
+                if (item.error) {
                     resultLines.push(
-                        `${r.number || number}\t${r.behavior || (r.ok ? 'ok' : 'error')}\t${r.message || '-'}`,
+                        `${item.number}\terror\t${item.error?.message || 'failed'}`,
                     );
-                } catch (error) {
-                    if (isDispatchUnavailableError(error)) {
-                        stoppedEarly = true;
-                        break;
-                    }
+                } else if (item.value) {
+                    const r = item.value;
                     resultLines.push(
-                        `${number}\terror\t${error?.message || 'failed'}`,
+                        `${r.number || item.number}\t${r.behavior || (r.ok ? 'ok' : 'error')}\t${r.message || '-'}`,
                     );
                 }
             }
@@ -2896,7 +3014,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
                 message: finalStoppedEarly
-                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
