@@ -1063,29 +1063,55 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
     }
 
     let lastError = '';
-    for (let i = 0; i < 3; i++) {
+    let lastNullFrom = 'client';
+    for (let i = 0; i < 4; i++) {
         try {
-            const url = await clientRef.getProfilePicUrl(jid);
-            if (url) {
-                return { url, note: '', attempts: i + 1 };
+            // Path A: direct client API
+            const urlA = await clientRef.getProfilePicUrl(jid);
+            if (urlA) {
+                return { url: urlA, note: '', attempts: i + 1 };
+            }
+            lastNullFrom = 'client';
+        } catch (e) {
+            lastError = String(e?.message || e || '')
+                .replace(/[\r\n\t]+/g, ' ')
+                .slice(0, 80);
+        }
+
+        try {
+            // Path B: contact API (same account, alternate WA path)
+            if (typeof clientRef.getContactById === 'function') {
+                const contact = await clientRef.getContactById(jid);
+                if (contact && typeof contact.getProfilePicUrl === 'function') {
+                    const urlB = await contact.getProfilePicUrl();
+                    if (urlB) {
+                        return { url: urlB, note: '', attempts: i + 1 };
+                    }
+                    lastNullFrom = 'contact';
+                }
             }
         } catch (e) {
             lastError = String(e?.message || e || '')
                 .replace(/[\r\n\t]+/g, ' ')
                 .slice(0, 80);
         }
-        if (i < 2) await sleep(120 + i * 180);
+
+        if (i < 3) await sleep(220 + i * 240);
     }
 
     if (lastError) {
         return {
             url: '',
             note: `avatar_fetch_failed:${lastError}`,
-            attempts: 3,
+            attempts: 4,
         };
     }
 
-    return { url: '', note: 'no_avatar_or_privacy', attempts: 3 };
+    return {
+        url: '',
+        note: `no_avatar_or_privacy:${lastNullFrom}`,
+        attempts: 4,
+    };
 };
 
 const resolveNumberIdWithFallback = async (
@@ -2652,6 +2678,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         let avatarUrl = '';
                         let note = '';
                         if (numberId?._serialized) {
+                            await sleep(90);
                             const avatarDetail = await resolveProfilePicWithDetail(
                                 numberId._serialized,
                                 resolved.clientRef || execClient,
