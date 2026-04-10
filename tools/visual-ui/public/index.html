@@ -1277,6 +1277,13 @@
                         let binary = '';
                         for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
                         body.fileContent = btoa(binary);
+
+                        // 同时提交文本版本，后端可在 base64 提取失败时自动回退
+                        try {
+                            body.numbers = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+                        } catch {
+                            body.numbers = await file.text();
+                        }
                     } catch {
                         errEl.textContent = '文件读取失败，请重试';
                         return;

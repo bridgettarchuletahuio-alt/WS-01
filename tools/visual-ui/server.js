@@ -1047,6 +1047,45 @@ const extractPhoneNumbersFromBuffer = (buffer) => {
     return [...new Set(merged)];
 };
 
+const extractPhoneNumbersFromFileContent = (rawFileContent) => {
+    const raw = String(rawFileContent || '').trim();
+    if (!raw) return [];
+
+    const tryDecode = (b64) => {
+        try {
+            const buf = Buffer.from(b64, 'base64');
+            if (!buf.length) return [];
+            return extractPhoneNumbersFromBuffer(buf);
+        } catch {
+            return [];
+        }
+    };
+
+    // 1) data URL base64
+    const dataUrlMatch = raw.match(/^data:[^;]+;base64,(.*)$/i);
+    if (dataUrlMatch?.[1]) {
+        const nums = tryDecode(dataUrlMatch[1]);
+        if (nums.length) return nums;
+    }
+
+    // 2) standard base64
+    {
+        const nums = tryDecode(raw);
+        if (nums.length) return nums;
+    }
+
+    // 3) base64url
+    {
+        const base64url = raw.replace(/-/g, '+').replace(/_/g, '/');
+        const padded = base64url + '='.repeat((4 - (base64url.length % 4)) % 4);
+        const nums = tryDecode(padded);
+        if (nums.length) return nums;
+    }
+
+    // 4) treat as plain text directly
+    return extractPhoneNumbers(raw);
+};
+
 const checkActivityByWsFrames = async (
     clientRef,
     rawNumber,
@@ -1880,10 +1919,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
     let parsedNumbers = [];
     if (fileContent) {
         try {
-            const raw = String(fileContent || '').trim();
-            const normalizedBase64 = raw.replace(/^data:[^;]+;base64,/i, '');
-            const buffer = Buffer.from(normalizedBase64, 'base64');
-            parsedNumbers = extractPhoneNumbersFromBuffer(buffer);
+            parsedNumbers = extractPhoneNumbersFromFileContent(fileContent);
         } catch {
             res.status(400).json({ ok: false, message: 'TXT文件解析失败' });
             return;
