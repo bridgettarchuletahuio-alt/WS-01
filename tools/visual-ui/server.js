@@ -1141,7 +1141,6 @@ const resolveProfilePicWithDetail = async (
         return isLikelyPhoneDigits(m[1]);
     };
     const isLikelyLidJid = (value) => /^\d{6,24}@lid$/i.test(String(value || '').trim());
-    const rawIsLid = isLikelyLidJid(raw);
     const pushCandidate = (id) => {
         const v = String(id || '').trim();
         if (!v) return;
@@ -1154,9 +1153,26 @@ const resolveProfilePicWithDetail = async (
         pushCandidate(raw);
     }
 
-    // For lid identities, do not degrade to c.us fallback.
-    // This avoids querying a mismatched identity and losing avatar hits.
-    if (!rawIsLid && isLikelyPhoneDigits(normalizedFallbackNumber)) {
+    // For lid identities, keep lid first, then add controlled fallbacks.
+    // Some accounts expose avatar only on PN/c.us identity path.
+    if (isLikelyPhoneDigits(normalizedFallbackNumber)) {
+        try {
+            const resolvedFromNumber = await resolveNumberId(
+                clientRef,
+                normalizedFallbackNumber,
+                1,
+            );
+            const resolvedJid = String(
+                resolvedFromNumber?._serialized || '',
+            ).trim();
+            if (resolvedJid && isCanonicalAvatarJid(resolvedJid)) {
+                pushCandidate(resolvedJid);
+            }
+        } catch {
+            // ignore and continue with synthetic candidate
+        }
+
+        // Keep synthetic c.us as last fallback candidate.
         pushCandidate(`${normalizedFallbackNumber}@c.us`);
     }
 
