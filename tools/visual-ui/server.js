@@ -960,11 +960,12 @@ const decodeTextBuffer = (buffer) => {
 const extractNumbersFromText = (text) => {
     const results = [];
     // 按行与常见列分隔符拆分，每个单元格整体剥离非数字字符
-    // 这样 "+86 138 1234 5678"、"86-138-1234-5678" 等格式均可正确提取
-    const tokens = text.split(/[\r\n,;|\t]+/);
+    // 这样 "+86 138 1234 5678"、"86-138-1234-5678"、"(8613) 8888 9999"
+    // 以及包含备注字符的行都可提取到号码。
+    const tokens = String(text || '').split(/[\r\n,;|，；\t]+/);
     for (const token of tokens) {
         const digits = token.replace(/[^0-9]/g, '');
-        if (digits.length >= 6 && digits.length <= 18) {
+        if (digits.length >= 6) {
             results.push(digits);
         }
     }
@@ -1833,7 +1834,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
     } else if (Array.isArray(numbers)) {
         parsedNumbers = numbers
             .map((n) => normalizePhoneInput(String(n || '')))
-            .filter((n) => n.length >= 6 && n.length <= 18);
+            .filter((n) => n.length >= 6);
     } else if (typeof numbers === 'string' && numbers.trim()) {
         parsedNumbers = extractPhoneNumbers(numbers);
     }
