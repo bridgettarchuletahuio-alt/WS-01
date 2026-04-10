@@ -763,8 +763,41 @@ const normalizeProbeAck = (ack) => {
     return 0;
 };
 
+const resolveNumberId = async (clientRef, number, retries = 2) => {
+    let last = null;
+
+    for (let i = 0; i <= retries; i++) {
+        try {
+            const value = await clientRef.getNumberId(number);
+            if (value) return value;
+            last = value;
+        } catch (error) {
+            // Temporary WA-side lookup failures are common; retry a few times.
+            last = null;
+        }
+
+        if (i < retries) {
+            await sleep(350 + i * 250);
+        }
+    }
+
+    // Fallback path: some sessions return null from getNumberId but can still
+    // verify registration through isRegisteredUser.
+    try {
+        if (typeof clientRef.isRegisteredUser === 'function') {
+            const jid = `${number}@c.us`;
+            const registered = await clientRef.isRegisteredUser(jid);
+            if (registered) return { _serialized: jid };
+        }
+    } catch {
+        // ignore fallback errors and return null
+    }
+
+    return last;
+};
+
 const runProbeForNumber = async (clientRef, number, probeText) => {
-    const numberId = await clientRef.getNumberId(number);
+    const numberId = await resolveNumberId(clientRef, number);
     if (!numberId) {
         return {
             ok: true,
@@ -1130,7 +1163,7 @@ const checkActivityByWsFrames = async (
 
     if (state === 'unknown') {
         try {
-            const numberId = await clientRef.getNumberId(number);
+            const numberId = await resolveNumberId(clientRef, number);
             state = numberId ? 'registered_no_presence' : 'unregistered';
         } catch {
             state = 'unknown';
@@ -1882,7 +1915,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 try {
                     const numberId = await runWithExecutionClient(
                         preferredClientId,
-                        (execClient) => execClient.getNumberId(number),
+                        (execClient) => resolveNumberId(execClient, number),
                         { allowedClientIds },
                     );
                     const status = numberId ? 'valid' : 'invalid';
@@ -1975,7 +2008,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 try {
                     const numberId = await runWithExecutionClient(
                         preferredClientId,
-                        (execClient) => execClient.getNumberId(number),
+                        (execClient) => resolveNumberId(execClient, number),
                         { allowedClientIds },
                     );
                     const waId = numberId?._serialized || '';
@@ -2350,7 +2383,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                     try {
                         const numberId = await runWithExecutionClient(
                             currentClientId,
-                            (execClient) => execClient.getNumberId(number),
+                            (execClient) => resolveNumberId(execClient, number),
                             { allowedClientIds: scopedClientIds },
                         );
                         const status = numberId ? 'valid' : 'invalid';
@@ -2510,7 +2543,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             try {
                 const numberId = await runWithExecutionClient(
                     currentClientId,
-                    (execClient) => execClient.getNumberId(number),
+                    (execClient) => resolveNumberId(execClient, number),
                     { allowedClientIds: routeClientIds },
                 );
                 const status = numberId ? 'valid' : 'invalid';
