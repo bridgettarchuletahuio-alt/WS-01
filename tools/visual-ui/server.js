@@ -1130,9 +1130,11 @@ const resolveProfilePicWithDetail = async (
         }
     };
     const jidCandidates = [];
+    const isCanonicalAvatarJid = (value) => /^\d{6,}@c\.us$/i.test(String(value || '').trim());
     const pushCandidate = (id) => {
         const v = String(id || '').trim();
         if (!v) return;
+        if (!isCanonicalAvatarJid(v)) return;
         if (!jidCandidates.includes(v)) jidCandidates.push(v);
     };
 
@@ -1144,11 +1146,16 @@ const resolveProfilePicWithDetail = async (
     if (normalizedRawUser.length >= 6) {
         pushCandidate(`${normalizedRawUser}@c.us`);
     }
-    if (/^\d+@c\.us$/i.test(raw)) {
+    if (isCanonicalAvatarJid(raw)) {
         pushCandidate(raw);
     }
-    if (!jidCandidates.length && raw) {
-        pushCandidate(raw);
+
+    if (!jidCandidates.length) {
+        return {
+            url: '',
+            note: `avatar_invalid_jid:${String(raw || '-').slice(0, 60)}|jid=${raw || '-'}`,
+            attempts: 0,
+        };
     }
 
     let lastError = '';
@@ -1288,21 +1295,26 @@ const summarizeAvatarFetchFailures = (rows = []) => {
 
     for (const row of rows) {
         const note = String(row?.note || '');
-        if (!note.includes('avatar_fetch_failed')) continue;
+        if (!note.includes('avatar_fetch_failed') && !note.includes('avatar_invalid_jid')) continue;
 
-        const errorText = (note.match(/^avatar_fetch_failed:([^|]+)/) || [])[1] || '';
+        const errorText =
+            (note.match(/^avatar_fetch_failed:([^|]+)/) || [])[1] ||
+            (note.match(/^avatar_invalid_jid:([^|]+)/) || [])[1] ||
+            '';
         const bot = (note.match(/\|bot=([^|]+)/) || [])[1] || '-';
-        const reason = classifyAvatarFetchError(errorText);
+        const reason = note.includes('avatar_invalid_jid')
+            ? 'jid'
+            : classifyAvatarFetchError(errorText);
         const cleanedError = String(errorText || '')
             .replace(/\s+/g, ' ')
             .trim()
             .slice(0, 180);
+        const triedJid = (note.match(/\|jid=([^|]+)/) || [])[1] || '-';
+        const displayError = `${cleanedError || 'unknown'} | jid=${triedJid}`;
 
         byReason[reason] = Number(byReason[reason] || 0) + 1;
         byBot[bot] = Number(byBot[bot] || 0) + 1;
-        if (cleanedError) {
-            byErrorText[cleanedError] = Number(byErrorText[cleanedError] || 0) + 1;
-        }
+        byErrorText[displayError] = Number(byErrorText[displayError] || 0) + 1;
     }
 
     const topReasonEntry = Object.entries(byReason).sort((a, b) => b[1] - a[1])[0] || [
@@ -2961,7 +2973,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const notRegisteredCount = excelRows.filter((r) => String(r.note || '').includes('not_registered')).length;
             const noAvatarCount = excelRows.filter((r) => String(r.note || '').includes('no_avatar')).length;
             const avatarFetchFailedRows = excelRows.filter((r) =>
-                String(r.note || '').includes('avatar_fetch_failed'),
+                String(r.note || '').includes('avatar_fetch_failed') ||
+                String(r.note || '').includes('avatar_invalid_jid'),
             );
             const avatarFetchFailedCount = avatarFetchFailedRows.length;
             const avatarFailureSummary = summarizeAvatarFetchFailures(
