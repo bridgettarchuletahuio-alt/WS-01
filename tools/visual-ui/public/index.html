@@ -728,6 +728,19 @@
                 routeErrorEl.textContent = msg || '';
             };
 
+            const syncMainQrViewportFromClients = () => {
+                const entries = Object.values(clientsState || {});
+                const withQr = entries.find((info) => info && info.qrDataUrl);
+                if (withQr && withQr.qrDataUrl) {
+                    qrEl.src = withQr.qrDataUrl;
+                    qrEl.hidden = false;
+                    qrEmptyEl.hidden = true;
+                    return;
+                }
+                qrEl.hidden = true;
+                qrEmptyEl.hidden = false;
+            };
+
             const triggerDownload = (blob, filename) => {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -1216,16 +1229,10 @@
                     item.appendChild(statusInfo);
                     item.appendChild(actions);
 
-                    if (info.qrDataUrl) {
-                        const qr = document.createElement('img');
-                        qr.className = 'client-qr';
-                        qr.src = info.qrDataUrl;
-                        qr.alt = `${clientId} 二维码`;
-                        item.appendChild(qr);
-                    }
-
                     clientsEl.appendChild(item);
                 }
+
+                syncMainQrViewportFromClients();
             };
 
             const setStatusColor = (status) => {
@@ -1384,6 +1391,11 @@
             });
 
             socket.on('qr', (dataUrl) => {
+                // 优先使用 clients 状态中的二维码（支持新加账号二维码统一显示到左上角）
+                if (Object.values(clientsState || {}).some((info) => info?.qrDataUrl)) {
+                    syncMainQrViewportFromClients();
+                    return;
+                }
                 if (dataUrl) {
                     qrEl.src = dataUrl;
                     qrEl.hidden = false;
@@ -1409,6 +1421,7 @@
                 clientsState = clients || {};
                 renderClients();
                 renderTaskClientSelect();
+                syncMainQrViewportFromClients();
             });
 
             socket.on('log', (line) => pushLog(line));
