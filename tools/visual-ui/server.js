@@ -1052,7 +1052,11 @@ const resolveProfilePicUrl = async (
     return '';
 };
 
-const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
+const resolveProfilePicWithDetail = async (
+    jid,
+    primaryClient = null,
+    fallbackNumber = '',
+) => {
     if (!jid) {
         return { url: '', note: 'missing_jid', attempts: 0 };
     }
@@ -1063,7 +1067,9 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
     }
 
     const raw = String(jid || '');
-    const userPart = raw.split('@')[0] || '';
+    const rawUser = raw.split('@')[0] || '';
+    const normalizedRawUser = normalizePhoneInput(rawUser);
+    const normalizedFallbackNumber = normalizePhoneInput(fallbackNumber);
     const pickHttpUrl = (value) => {
         const v = String(value || '').trim();
         return /^https?:\/\//i.test(v) ? v : '';
@@ -1129,9 +1135,20 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
         if (!v) return;
         if (!jidCandidates.includes(v)) jidCandidates.push(v);
     };
-    pushCandidate(raw);
-    if (userPart) {
-        pushCandidate(`${userPart}@c.us`);
+
+    // Only use canonical numeric WA IDs for avatar lookup to avoid
+    // errors like "No LID for user s" from malformed/non-numeric JIDs.
+    if (normalizedFallbackNumber.length >= 6) {
+        pushCandidate(`${normalizedFallbackNumber}@c.us`);
+    }
+    if (normalizedRawUser.length >= 6) {
+        pushCandidate(`${normalizedRawUser}@c.us`);
+    }
+    if (/^\d+@c\.us$/i.test(raw)) {
+        pushCandidate(raw);
+    }
+    if (!jidCandidates.length && raw) {
+        pushCandidate(raw);
     }
 
     let lastError = '';
@@ -2899,6 +2916,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                             const avatarDetail = await resolveProfilePicWithDetail(
                                 numberId._serialized,
                                 resolved.clientRef || execClient,
+                                number,
                             );
                             avatarUrl = avatarDetail.url;
                             if (!avatarUrl) {
