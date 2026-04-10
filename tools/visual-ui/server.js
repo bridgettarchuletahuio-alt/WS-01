@@ -51,7 +51,29 @@ const MAIN_CLIENT_ID =
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
-const normalizePhoneInput = (raw) => raw.replace(/[^0-9]/g, '');
+const normalizePhoneInput = (raw) => {
+    const text = String(raw || '').normalize('NFKC');
+    let out = '';
+    for (const ch of text) {
+        const code = ch.charCodeAt(0);
+        // ASCII 0-9
+        if (code >= 48 && code <= 57) {
+            out += ch;
+            continue;
+        }
+        // Arabic-Indic digits (U+0660..U+0669)
+        if (code >= 0x0660 && code <= 0x0669) {
+            out += String(code - 0x0660);
+            continue;
+        }
+        // Extended Arabic-Indic digits (U+06F0..U+06F9)
+        if (code >= 0x06f0 && code <= 0x06f9) {
+            out += String(code - 0x06f0);
+            continue;
+        }
+    }
+    return out;
+};
 const commandSeen = new Set();
 const awaitingTxtModeByChat = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -964,7 +986,7 @@ const extractNumbersFromText = (text) => {
     // 以及包含备注字符的行都可提取到号码。
     const tokens = String(text || '').split(/[\r\n,;|，；\t]+/);
     for (const token of tokens) {
-        const digits = token.replace(/[^0-9]/g, '');
+        const digits = normalizePhoneInput(token);
         if (digits.length >= 6) {
             results.push(digits);
         }
