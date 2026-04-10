@@ -33,7 +33,7 @@
             }
 
             .wrap {
-                max-width: 980px;
+                max-width: 1180px;
                 margin: 0 auto;
                 padding: 24px;
             }
@@ -44,6 +44,12 @@
                 align-items: center;
                 gap: 12px;
                 margin-bottom: 16px;
+            }
+
+            .title-right {
+                display: flex;
+                align-items: center;
+                gap: 10px;
             }
 
             h1 {
@@ -62,7 +68,7 @@
 
             .grid {
                 display: grid;
-                grid-template-columns: 340px 1fr;
+                grid-template-columns: 360px 1fr;
                 gap: 16px;
             }
 
@@ -96,7 +102,7 @@
             }
 
             .logs {
-                max-height: 520px;
+                max-height: 300px;
                 overflow: auto;
                 margin: 0;
                 padding: 12px;
@@ -120,6 +126,138 @@
                 color: #374151;
             }
 
+            .clients {
+                margin-top: 14px;
+                display: grid;
+                gap: 10px;
+            }
+
+            .client-item {
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 10px;
+                background: #fff;
+            }
+
+            .client-top {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 8px;
+            }
+
+            .client-id {
+                font-family: "JetBrains Mono", monospace;
+                font-size: 13px;
+            }
+
+            .client-role {
+                font-size: 12px;
+                border-radius: 999px;
+                padding: 2px 8px;
+                background: #e6fffa;
+                color: #0f766e;
+                border: 1px solid #b7efe7;
+            }
+
+            .client-status {
+                font-size: 13px;
+                color: #374151;
+            }
+
+            .client-actions {
+                margin-top: 8px;
+                display: flex;
+                gap: 8px;
+            }
+
+            .btn {
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                padding: 6px 10px;
+                background: #fffdf9;
+                color: #1f2a37;
+                cursor: pointer;
+                font-size: 13px;
+            }
+
+            .btn:disabled {
+                opacity: 0.55;
+                cursor: not-allowed;
+            }
+
+            .btn-primary {
+                background: #0f766e;
+                color: #fff;
+                border-color: #0f766e;
+            }
+
+            .client-qr {
+                margin-top: 8px;
+                width: 140px;
+                max-width: 100%;
+                border: 1px dashed #d5c9b7;
+                border-radius: 8px;
+                background: #fff;
+            }
+
+            .routes-wrap {
+                margin-top: 12px;
+            }
+
+            .routes-form {
+                display: grid;
+                gap: 8px;
+                margin-bottom: 12px;
+            }
+
+            .input {
+                width: 100%;
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                padding: 8px 10px;
+                background: #fff;
+                color: var(--text);
+            }
+
+            .chips {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+
+            .chip {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                padding: 4px 8px;
+                font-size: 12px;
+                background: #fff;
+            }
+
+            .routes-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }
+
+            .routes-table th,
+            .routes-table td {
+                text-align: left;
+                border-bottom: 1px solid var(--border);
+                padding: 8px 6px;
+                vertical-align: top;
+            }
+
+            .error {
+                color: var(--err);
+                font-size: 13px;
+                min-height: 20px;
+            }
+
             @media (max-width: 900px) {
                 .grid {
                     grid-template-columns: 1fr;
@@ -131,7 +269,11 @@
         <div class="wrap">
             <div class="title">
                 <h1>WhatsApp Bot 可视化控制台</h1>
-                <span id="status" class="badge">starting</span>
+                <div class="title-right">
+                    <span id="user-badge" class="badge">未登录</span>
+                    <span id="status" class="badge">starting</span>
+                    <button id="logout-btn" class="btn">退出</button>
+                </div>
             </div>
 
             <div class="grid">
@@ -141,12 +283,37 @@
                         <div id="qr-empty" class="muted">等待二维码...</div>
                     </div>
                     <div class="loading" id="loading">加载状态: -</div>
+                    <div class="clients" id="clients"></div>
                     <p class="muted">
                         登录后请用另一个账号给机器人发送 !ping，若自动回复 pong 说明功能正常。
                     </p>
                 </section>
 
                 <section class="card">
+                    <h3 style="margin-top: 0">客户路由规则</h3>
+                    <div class="routes-wrap">
+                        <div class="routes-form">
+                            <input id="chat-id-input" class="input" placeholder="客户Chat ID，如 8613xxxxx@c.us" />
+                            <input id="demand-tag-input" class="input" placeholder="需求标签，如 金融/电商/高净值" />
+                            <div class="chips" id="client-chips"></div>
+                            <button id="save-route-btn" class="btn btn-primary">保存路由规则</button>
+                            <div id="route-error" class="error"></div>
+                        </div>
+
+                        <table class="routes-table">
+                            <thead>
+                                <tr>
+                                    <th>Chat ID</th>
+                                    <th>需求标签</th>
+                                    <th>筛选账号</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="routes-body"></tbody>
+                        </table>
+                    </div>
+
+                    <h3>系统日志</h3>
                     <ul class="logs" id="logs"></ul>
                 </section>
             </div>
@@ -154,13 +321,175 @@
 
         <script src="/socket.io/socket.io.js"></script>
         <script>
+            const tokenKey = 'wwebjs_visual_token';
+            const token = localStorage.getItem(tokenKey);
+            if (!token) {
+                window.location.href = '/auth.html';
+            }
+
             const statusEl = document.getElementById('status');
             const qrEl = document.getElementById('qr');
             const qrEmptyEl = document.getElementById('qr-empty');
             const logsEl = document.getElementById('logs');
             const loadingEl = document.getElementById('loading');
+            const clientsEl = document.getElementById('clients');
+            const logoutBtn = document.getElementById('logout-btn');
+            const userBadgeEl = document.getElementById('user-badge');
+            const chatIdInput = document.getElementById('chat-id-input');
+            const demandTagInput = document.getElementById('demand-tag-input');
+            const clientChipsEl = document.getElementById('client-chips');
+            const saveRouteBtn = document.getElementById('save-route-btn');
+            const routeErrorEl = document.getElementById('route-error');
+            const routesBodyEl = document.getElementById('routes-body');
 
             const socket = io();
+            let clientsState = {};
+            let roleState = { mainClientId: null };
+            let availableRouteClients = [];
+
+            const authFetch = (url, options = {}) => {
+                return fetch(url, {
+                    ...options,
+                    headers: {
+                        'content-type': 'application/json',
+                        Authorization: `Bearer ${localStorage.getItem(tokenKey) || ''}`,
+                        ...(options.headers || {}),
+                    },
+                });
+            };
+
+            const setRouteError = (msg) => {
+                routeErrorEl.textContent = msg || '';
+            };
+
+            const selectedRouteClientIds = () => {
+                return [...clientChipsEl.querySelectorAll('input[type="checkbox"]:checked')].map(
+                    (item) => item.value,
+                );
+            };
+
+            const renderRouteClientChoices = () => {
+                clientChipsEl.innerHTML = '';
+                const list = availableRouteClients.filter((id) => id !== roleState.mainClientId);
+                if (!list.length) {
+                    const span = document.createElement('span');
+                    span.className = 'muted';
+                    span.textContent = '暂无可选筛选账号';
+                    clientChipsEl.appendChild(span);
+                    return;
+                }
+                list.forEach((id) => {
+                    const label = document.createElement('label');
+                    label.className = 'chip';
+                    const input = document.createElement('input');
+                    input.type = 'checkbox';
+                    input.value = id;
+                    label.appendChild(input);
+                    label.appendChild(document.createTextNode(id));
+                    clientChipsEl.appendChild(label);
+                });
+            };
+
+            const ensureAuth = async () => {
+                try {
+                    const resp = await authFetch('/api/auth/me', { method: 'GET' });
+                    if (!resp.ok) {
+                        localStorage.removeItem(tokenKey);
+                        window.location.href = '/auth.html';
+                        return false;
+                    }
+                    const data = await resp.json();
+                    userBadgeEl.textContent = `${data.user.username} (${data.user.role})`;
+                    return true;
+                } catch {
+                    localStorage.removeItem(tokenKey);
+                    window.location.href = '/auth.html';
+                    return false;
+                }
+            };
+
+            const callClientAction = async (clientId, action) => {
+                try {
+                    const resp = await authFetch(`/api/clients/${encodeURIComponent(clientId)}/${action}`, {
+                        method: 'POST',
+                    });
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        alert(data.message || '操作失败');
+                    }
+                } catch {
+                    alert('网络异常，操作失败');
+                }
+            };
+
+            const renderClients = () => {
+                const entries = Object.entries(clientsState);
+                clientsEl.innerHTML = '';
+
+                if (!entries.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'muted';
+                    empty.textContent = '暂无账号状态';
+                    clientsEl.appendChild(empty);
+                    return;
+                }
+
+                for (const [clientId, info] of entries) {
+                    const item = document.createElement('div');
+                    item.className = 'client-item';
+
+                    const top = document.createElement('div');
+                    top.className = 'client-top';
+
+                    const idEl = document.createElement('div');
+                    idEl.className = 'client-id';
+                    idEl.textContent = clientId;
+
+                    const roleEl = document.createElement('span');
+                    roleEl.className = 'client-role';
+                    roleEl.textContent =
+                        clientId === roleState.mainClientId ? '主机器人' : '筛选账号';
+
+                    top.appendChild(idEl);
+                    top.appendChild(roleEl);
+
+                    const statusInfo = document.createElement('div');
+                    statusInfo.className = 'client-status';
+                    statusInfo.textContent = `状态: ${info.status || 'unknown'}`;
+
+                    const actions = document.createElement('div');
+                    actions.className = 'client-actions';
+
+                    const onlineBtn = document.createElement('button');
+                    onlineBtn.className = 'btn';
+                    onlineBtn.textContent = '上线';
+                    onlineBtn.disabled = info.status === 'ready' || info.status === 'authenticated';
+                    onlineBtn.addEventListener('click', () => callClientAction(clientId, 'online'));
+
+                    const offlineBtn = document.createElement('button');
+                    offlineBtn.className = 'btn';
+                    offlineBtn.textContent = '下线';
+                    offlineBtn.disabled = info.status === 'manual_offline';
+                    offlineBtn.addEventListener('click', () => callClientAction(clientId, 'offline'));
+
+                    actions.appendChild(onlineBtn);
+                    actions.appendChild(offlineBtn);
+
+                    item.appendChild(top);
+                    item.appendChild(statusInfo);
+                    item.appendChild(actions);
+
+                    if (info.qrDataUrl) {
+                        const qr = document.createElement('img');
+                        qr.className = 'client-qr';
+                        qr.src = info.qrDataUrl;
+                        qr.alt = `${clientId} 二维码`;
+                        item.appendChild(qr);
+                    }
+
+                    clientsEl.appendChild(item);
+                }
+            };
 
             const setStatusColor = (status) => {
                 if (status === 'ready') {
@@ -196,6 +525,81 @@
                 logsEl.scrollTop = logsEl.scrollHeight;
             };
 
+            const renderRoutes = (items) => {
+                routesBodyEl.innerHTML = '';
+                if (!items.length) {
+                    const tr = document.createElement('tr');
+                    const td = document.createElement('td');
+                    td.colSpan = 4;
+                    td.className = 'muted';
+                    td.textContent = '暂无路由规则';
+                    tr.appendChild(td);
+                    routesBodyEl.appendChild(tr);
+                    return;
+                }
+
+                items.forEach((item) => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td>${item.chatId}</td>
+                        <td>${item.demandTag}</td>
+                        <td>${(item.clientIds || []).join(', ')}</td>
+                        <td><button class="btn" data-id="${item.id}">删除</button></td>
+                    `;
+                    tr.querySelector('button').addEventListener('click', async () => {
+                        const resp = await authFetch(`/api/routes/${item.id}`, { method: 'DELETE' });
+                        if (!resp.ok) {
+                            const data = await resp.json().catch(() => ({}));
+                            alert(data.message || '删除失败');
+                            return;
+                        }
+                        await loadRoutes();
+                    });
+                    routesBodyEl.appendChild(tr);
+                });
+            };
+
+            const loadRoutes = async () => {
+                const resp = await authFetch('/api/routes', { method: 'GET' });
+                const data = await resp.json().catch(() => ({ ok: false, items: [] }));
+                if (!resp.ok || !data.ok) {
+                    setRouteError(data.message || '加载路由失败');
+                    return;
+                }
+                setRouteError('');
+                availableRouteClients = data.availableClientIds || [];
+                renderRouteClientChoices();
+                renderRoutes(data.items || []);
+            };
+
+            saveRouteBtn.addEventListener('click', async () => {
+                const chatId = chatIdInput.value.trim();
+                const demandTag = demandTagInput.value.trim();
+                const clientIds = selectedRouteClientIds();
+
+                const resp = await authFetch('/api/routes', {
+                    method: 'POST',
+                    body: JSON.stringify({ chatId, demandTag, clientIds }),
+                });
+                const data = await resp.json().catch(() => ({ ok: false }));
+                if (!resp.ok || !data.ok) {
+                    setRouteError(data.message || '保存失败');
+                    return;
+                }
+                setRouteError('保存成功');
+                chatIdInput.value = '';
+                demandTagInput.value = '';
+                clientChipsEl
+                    .querySelectorAll('input[type="checkbox"]')
+                    .forEach((item) => (item.checked = false));
+                await loadRoutes();
+            });
+
+            logoutBtn.addEventListener('click', () => {
+                localStorage.removeItem(tokenKey);
+                window.location.href = '/auth.html';
+            });
+
             socket.on('status', (status) => {
                 statusEl.textContent = status;
                 setStatusColor(status);
@@ -225,7 +629,24 @@
                 logs.forEach(pushLog);
             });
 
+            socket.on('role', (role) => {
+                roleState = role || { mainClientId: null };
+                renderClients();
+                renderRouteClientChoices();
+            });
+
+            socket.on('clients', (clients) => {
+                clientsState = clients || {};
+                renderClients();
+            });
+
             socket.on('log', (line) => pushLog(line));
+
+            (async () => {
+                const ok = await ensureAuth();
+                if (!ok) return;
+                await loadRoutes();
+            })();
         </script>
     </body>
 </html>

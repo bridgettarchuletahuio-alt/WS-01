@@ -38,12 +38,16 @@
     },
     "homepage": "https://wwebjs.dev/",
     "dependencies": {
+        "bcryptjs": "^2.4.3",
         "exceljs": "^4.4.0",
         "express": "^5.2.1",
         "fluent-ffmpeg": "2.1.3",
+        "jsonwebtoken": "^9.0.2",
         "mime": "^3.0.0",
+        "mongodb": "^6.16.0",
         "node-fetch": "^2.6.9",
         "node-webpmux": "3.1.7",
+        "pg": "^8.13.1",
         "puppeteer": "^24.31.0",
         "qrcode": "^1.5.4",
         "socket.io": "^4.8.3"

@@ -5,24 +5,48 @@ const path = require('path');
 const fs = require('fs/promises');
 const os = require('os');
 const zlib = require('zlib');
+const fsSync = require('fs');
 
 const express = require('express');
 const ExcelJS = require('exceljs');
 const QRCode = require('qrcode');
 const { Server } = require('socket.io');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
+const { MongoClient } = require('mongodb');
 
-const { Client, LocalAuth, MessageMedia } = require('../../index');
+const { Client, LocalAuth, RemoteAuth, MessageMedia } = require('../../index');
 
 const PORT = Number(process.env.PORT || process.env.WWEBJS_UI_PORT || 3399);
 const HOST = process.env.HOST || '0.0.0.0';
 const AUTH_DIR = process.env.WWEBJS_AUTH_DIR
     ? path.resolve(process.env.WWEBJS_AUTH_DIR)
     : path.resolve(process.cwd(), '.wwebjs_auth');
+const REMOTE_AUTH_ENABLED =
+    String(process.env.REMOTE_AUTH_ENABLED || 'false').toLowerCase() === 'true';
+const REMOTE_AUTH_STORE = String(process.env.REMOTE_AUTH_STORE || 'postgres').toLowerCase();
+const REMOTE_AUTH_MONGO_URI =
+    process.env.REMOTE_AUTH_MONGO_URI || process.env.MONGODB_URI || '';
+const REMOTE_AUTH_DB_NAME = process.env.REMOTE_AUTH_DB_NAME || 'wwebjs';
+const REMOTE_AUTH_COLLECTION =
+    process.env.REMOTE_AUTH_COLLECTION || 'wwebjs_remote_sessions';
+const REMOTE_AUTH_DATA_PATH = process.env.REMOTE_AUTH_DATA_PATH
+    ? path.resolve(process.env.REMOTE_AUTH_DATA_PATH)
+    : path.resolve(process.cwd(), '.wwebjs_remote_auth');
+const REMOTE_AUTH_BACKUP_INTERVAL_MS = Number(
+    process.env.REMOTE_AUTH_BACKUP_INTERVAL_MS || 300000,
+);
 const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH;
 const CLIENT_IDS = String(process.env.WWEBJS_CLIENT_IDS || 'visual-ui')
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
+const MAIN_CLIENT_ID =
+    process.env.WWEBJS_MAIN_CLIENT_ID &&
+    CLIENT_IDS.includes(process.env.WWEBJS_MAIN_CLIENT_ID.trim())
+        ? process.env.WWEBJS_MAIN_CLIENT_ID.trim()
+        : CLIENT_IDS[0];
 
 const app = express();
 const server = http.createServer(app);
@@ -32,10 +56,272 @@ const commandSeen = new Set();
 const awaitingTxtModeByChat = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clientPool = new Map();
+const contactGuardCache = new Map();
 let rrCursor = 0;
 
 const makeChatScopeKey = (clientId, chatId) => `${clientId}::${chatId}`;
 const AVATAR_FETCH_TIMEOUT_MS = Number(process.env.AVATAR_FETCH_TIMEOUT_MS || 12000);
+const CONTACT_GUARD_CACHE_TTL_MS = Number(
+    process.env.CONTACT_GUARD_CACHE_TTL_MS || 21600000,
+);
+const AUTO_LINK_FILTER_BOTS =
+    String(process.env.AUTO_LINK_FILTER_BOTS || 'true').toLowerCase() === 'true';
+const AUTO_LINK_TEXT =
+    process.env.AUTO_LINK_TEXT || '系统建联消息（机器人自动发送），可忽略。';
+const JWT_SECRET = process.env.JWT_SECRET || 'change_me_in_production';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+let dbPool = null;
+let dbReady = false;
+let remoteMongoClient = null;
+let remoteSessionStore = null;
+const chatRouteCache = new Map();
+const CHAT_ROUTE_CACHE_TTL_MS = Number(process.env.CHAT_ROUTE_CACHE_TTL_MS || 120000);
+
+const parseClientIdList = (raw) => {
+    if (!raw) return [];
+    if (Array.isArray(raw)) {
+        return raw
+            .map((item) => String(item || '').trim())
+            .filter((item) => CLIENT_IDS.includes(item));
+    }
+    return String(raw)
+        .split(/[\s,;，；|]+/)
+        .map((item) => item.trim())
+        .filter((item) => CLIENT_IDS.includes(item));
+};
+
+const toClientIdsText = (clientIds) => parseClientIdList(clientIds).join(',');
+
+const fromClientIdsText = (value) =>
+    String(value || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter((item) => CLIENT_IDS.includes(item));
+
+const issueToken = (user) => {
+    return jwt.sign(
+        {
+            sub: user.id,
+            username: user.username,
+            role: user.role,
+        },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES_IN },
+    );
+};
+
+const dbUnavailable = (res) => {
+    res.status(503).json({ ok: false, message: '数据库未启用，请先配置 DATABASE_URL' });
+};
+
+const authRequired = async (req, res, next) => {
+    const auth = String(req.headers.authorization || '');
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+    if (!token) {
+        res.status(401).json({ ok: false, message: '未登录' });
+        return;
+    }
+
+    try {
+        req.user = jwt.verify(token, JWT_SECRET);
+        next();
+    } catch {
+        res.status(401).json({ ok: false, message: '登录已失效，请重新登录' });
+    }
+};
+
+const dbQuery = async (sql, params = []) => {
+    if (!dbPool) throw new Error('db_not_ready');
+    return dbPool.query(sql, params);
+};
+
+class MongoZipStore {
+    constructor({ mongoClient, dbName, collectionName, dataPath }) {
+        this.mongoClient = mongoClient;
+        this.collection = this.mongoClient
+            .db(dbName)
+            .collection(collectionName || 'wwebjs_remote_sessions');
+        this.dataPath = dataPath;
+    }
+
+    async sessionExists({ session }) {
+        const count = await this.collection.countDocuments({ session }, { limit: 1 });
+        return count > 0;
+    }
+
+    async save({ session }) {
+        const zipPath = path.join(this.dataPath, `${session}.zip`);
+        const zipData = await fs.readFile(zipPath);
+        await this.collection.updateOne(
+            { session },
+            {
+                $set: {
+                    session,
+                    data: zipData,
+                    updatedAt: new Date(),
+                },
+            },
+            { upsert: true },
+        );
+    }
+
+    async extract({ session, path: outPath }) {
+        const doc = await this.collection.findOne({ session });
+        if (!doc?.data) throw new Error('remote_session_not_found');
+        await fs.writeFile(outPath, doc.data);
+    }
+
+    async delete({ session }) {
+        await this.collection.deleteOne({ session });
+    }
+}
+
+class PostgresZipStore {
+    constructor({ dataPath }) {
+        this.dataPath = dataPath;
+    }
+
+    async sessionExists({ session }) {
+        const result = await dbQuery(
+            `SELECT 1 FROM remote_sessions WHERE session = $1 LIMIT 1`,
+            [session],
+        );
+        return Boolean(result.rows[0]);
+    }
+
+    async save({ session }) {
+        const zipPath = path.join(this.dataPath, `${session}.zip`);
+        const zipData = await fs.readFile(zipPath);
+        await dbQuery(
+            `INSERT INTO remote_sessions (session, data, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (session)
+             DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+            [session, zipData],
+        );
+    }
+
+    async extract({ session, path: outPath }) {
+        const result = await dbQuery(
+            `SELECT data FROM remote_sessions WHERE session = $1 LIMIT 1`,
+            [session],
+        );
+        const row = result.rows[0];
+        if (!row?.data) throw new Error('remote_session_not_found');
+        await fs.writeFile(outPath, row.data);
+    }
+
+    async delete({ session }) {
+        await dbQuery(`DELETE FROM remote_sessions WHERE session = $1`, [session]);
+    }
+}
+
+const initRemoteAuthStore = async () => {
+    if (!REMOTE_AUTH_ENABLED) return;
+
+    fsSync.mkdirSync(REMOTE_AUTH_DATA_PATH, { recursive: true });
+
+    if (REMOTE_AUTH_STORE === 'mongo') {
+        if (!REMOTE_AUTH_MONGO_URI) {
+            throw new Error(
+                'REMOTE_AUTH_STORE=mongo 但未配置 REMOTE_AUTH_MONGO_URI/MONGODB_URI',
+            );
+        }
+        remoteMongoClient = new MongoClient(REMOTE_AUTH_MONGO_URI);
+        await remoteMongoClient.connect();
+        remoteSessionStore = new MongoZipStore({
+            mongoClient: remoteMongoClient,
+            dbName: REMOTE_AUTH_DB_NAME,
+            collectionName: REMOTE_AUTH_COLLECTION,
+            dataPath: REMOTE_AUTH_DATA_PATH,
+        });
+        return;
+    }
+
+    if (!dbPool) {
+        throw new Error('REMOTE_AUTH_STORE=postgres 需要先配置并连接 DATABASE_URL');
+    }
+
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS remote_sessions (
+            session VARCHAR(128) PRIMARY KEY,
+            data BYTEA NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+    );
+    remoteSessionStore = new PostgresZipStore({
+        dataPath: REMOTE_AUTH_DATA_PATH,
+    });
+};
+
+const getChatRouteClientIds = async (chatId) => {
+    if (!dbReady || !chatId) return null;
+
+    const cached = chatRouteCache.get(chatId);
+    if (cached && Date.now() - cached.ts < CHAT_ROUTE_CACHE_TTL_MS) {
+        return cached.clientIds;
+    }
+
+    const result = await dbQuery(
+        `SELECT client_ids
+         FROM customer_routes
+         WHERE chat_id = $1
+         LIMIT 1`,
+        [chatId],
+    );
+
+    const row = result.rows[0];
+    const clientIds = row ? fromClientIdsText(row.client_ids) : null;
+    chatRouteCache.set(chatId, { ts: Date.now(), clientIds });
+    return clientIds;
+};
+
+const initDatabase = async () => {
+    if (!DATABASE_URL) {
+        log('未配置 DATABASE_URL，注册/路由管理功能将不可用。');
+        return;
+    }
+
+    const useSsl =
+        String(process.env.PGSSL || process.env.PGSSLMODE || '').toLowerCase() === 'require' ||
+        String(process.env.PG_SSL || 'true').toLowerCase() === 'true';
+
+    dbPool = new Pool({
+        connectionString: DATABASE_URL,
+        ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+    });
+
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS app_users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(64) UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role VARCHAR(16) NOT NULL DEFAULT 'operator',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+    );
+
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS customer_routes (
+            id SERIAL PRIMARY KEY,
+            chat_id VARCHAR(96) UNIQUE NOT NULL,
+            demand_tag VARCHAR(96) NOT NULL,
+            client_ids TEXT NOT NULL,
+            owner_user_id INTEGER REFERENCES app_users(id) ON DELETE SET NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+    );
+
+    await dbQuery(
+        `CREATE INDEX IF NOT EXISTS idx_customer_routes_owner ON customer_routes(owner_user_id)`,
+    );
+
+    dbReady = true;
+    log('PostgreSQL 已连接，注册与客户路由功能已启用。');
+};
 
 const detectImageExt = (mimeType = '', url = '') => {
     const lowerMime = String(mimeType).toLowerCase();
@@ -414,24 +700,157 @@ const getReadyClients = () => {
     return [...clientPool.values()].filter((entry) => entry.status === 'ready');
 };
 
-const pickExecutionClient = (preferredClientId) => {
-    const ready = getReadyClients();
-    if (!ready.length) return null;
-
-    const preferred = ready.find((entry) => entry.clientId === preferredClientId);
-    if (preferred) return preferred;
-
-    const picked = ready[rrCursor % ready.length];
-    rrCursor = (rrCursor + 1) % Math.max(ready.length, 1);
-    return picked;
+const getReadyFilterClients = (allowedClientIds = null) => {
+    const allowSet = Array.isArray(allowedClientIds) && allowedClientIds.length
+        ? new Set(allowedClientIds)
+        : null;
+    return getReadyClients().filter((entry) => {
+        if (entry.clientId === MAIN_CLIENT_ID) return false;
+        if (!allowSet) return true;
+        return allowSet.has(entry.clientId);
+    });
 };
 
-const runWithExecutionClient = async (preferredClientId, fn) => {
-    const selected = pickExecutionClient(preferredClientId);
-    if (!selected) {
-        throw new Error('暂无可用账号，请稍后重试或重新登录');
+const buildClientJid = (entry) => {
+    const serialized = entry?.client?.info?.wid?._serialized;
+    if (serialized) return serialized;
+
+    const user = entry?.client?.info?.wid?.user;
+    if (user) return `${user}@c.us`;
+    return '';
+};
+
+const ensureMainFilterLink = async (filterEntry) => {
+    const cacheKey = filterEntry.clientId;
+    const cached = contactGuardCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < CONTACT_GUARD_CACHE_TTL_MS) {
+        return { ok: cached.ok, reason: cached.reason };
     }
-    return fn(selected.client, selected.clientId);
+
+    const mainEntry = clientPool.get(MAIN_CLIENT_ID);
+    if (!mainEntry || mainEntry.status !== 'ready') {
+        const result = { ok: false, reason: '主机器人账号未就绪' };
+        contactGuardCache.set(cacheKey, { ...result, ts: Date.now() });
+        return result;
+    }
+
+    const mainJid = buildClientJid(mainEntry);
+    const filterJid = buildClientJid(filterEntry);
+    const mainNumber = mainJid.split('@')[0] || '';
+    const filterNumber = filterJid.split('@')[0] || '';
+
+    if (!mainJid || !filterJid || !mainNumber || !filterNumber) {
+        const result = { ok: false, reason: '账号JID未就绪，请稍后重试' };
+        contactGuardCache.set(cacheKey, { ...result, ts: Date.now() });
+        return result;
+    }
+
+    try {
+        const [mainToFilterId, filterToMainId] = await Promise.all([
+            mainEntry.client.getNumberId(filterNumber).catch(() => null),
+            filterEntry.client.getNumberId(mainNumber).catch(() => null),
+        ]);
+
+        if (!mainToFilterId || !filterToMainId) {
+            const result = {
+                ok: false,
+                reason: '账号互通校验失败，请确认两个WS账号均为有效注册号码',
+            };
+            contactGuardCache.set(cacheKey, { ...result, ts: Date.now() });
+            return result;
+        }
+
+        if (AUTO_LINK_FILTER_BOTS) {
+            await Promise.allSettled([
+                mainEntry.client.sendMessage(
+                    mainToFilterId._serialized || `${filterNumber}@c.us`,
+                    AUTO_LINK_TEXT,
+                ),
+                filterEntry.client.sendMessage(
+                    filterToMainId._serialized || `${mainNumber}@c.us`,
+                    AUTO_LINK_TEXT,
+                ),
+            ]);
+        }
+
+        const result = { ok: true, reason: '' };
+
+        contactGuardCache.set(cacheKey, { ...result, ts: Date.now() });
+        return result;
+    } catch {
+        const result = { ok: false, reason: '自动建联失败，请稍后重试' };
+        contactGuardCache.set(cacheKey, { ...result, ts: Date.now() });
+        return result;
+    }
+};
+
+const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
+    const ready = getReadyFilterClients(options.allowedClientIds || null);
+    if (!ready.length) {
+        throw new Error('暂无可用筛选账号，请先登录其他WS账号作为筛选账号');
+    }
+
+    const preferred = ready.find((entry) => entry.clientId === preferredClientId);
+    const rrOrdered = [
+        ...ready.slice(rrCursor % ready.length),
+        ...ready.slice(0, rrCursor % ready.length),
+    ];
+    const ordered = preferred
+        ? [preferred, ...rrOrdered.filter((item) => item.clientId !== preferred.clientId)]
+        : rrOrdered;
+
+    let sawRuntimeUnavailable = false;
+
+    for (const selected of ordered) {
+        const guard = await ensureMainFilterLink(selected);
+        if (!guard.ok) continue;
+
+        try {
+            rrCursor = (rrCursor + 1) % Math.max(ready.length, 1);
+            return await fn(selected.client, selected.clientId);
+        } catch (error) {
+            if (!isExecutionClientUnavailableError(error)) {
+                throw error;
+            }
+
+            sawRuntimeUnavailable = true;
+            contactGuardCache.delete(selected.clientId);
+            continue;
+        }
+    }
+
+    if (sawRuntimeUnavailable) {
+        throw new Error('暂无可用筛选账号（执行中断且无可接管账号）');
+    }
+
+    throw new Error(
+        '暂无符合条件的筛选账号：请确保筛选账号在线，且主机器人与筛选账号可互通',
+    );
+};
+
+const isExecutionClientUnavailableError = (error) => {
+    const message = String(error?.message || error || '').toLowerCase();
+    return (
+        message.includes('session closed') ||
+        message.includes('target closed') ||
+        message.includes('execution context was destroyed') ||
+        message.includes('not attached to an active page') ||
+        message.includes('protocol error') ||
+        message.includes('disconnected') ||
+        message.includes('connection closed') ||
+        message.includes('connection lost') ||
+        message.includes('browser has disconnected') ||
+        message.includes('client is not ready') ||
+        message.includes('wid')
+    );
+};
+
+const isDispatchUnavailableError = (error) => {
+    const message = String(error?.message || error || '');
+    return (
+        message.includes('暂无可用筛选账号') ||
+        message.includes('暂无符合条件的筛选账号')
+    );
 };
 
 const maskSensitive = (text) =>
@@ -706,6 +1125,9 @@ const state = {
     loading: null,
     logs: [],
     clients: {},
+    role: {
+        mainClientId: MAIN_CLIENT_ID,
+    },
 };
 
 const log = (message) => {
@@ -743,9 +1165,306 @@ const setClientState = (clientId, patch) => {
 };
 
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({ limit: '1mb' }));
+
+app.post('/api/auth/register', async (req, res) => {
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
+
+    const username = String(req.body?.username || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+
+    if (!/^[a-z0-9_]{3,32}$/.test(username)) {
+        res.status(400).json({ ok: false, message: '用户名需为3-32位字母数字下划线' });
+        return;
+    }
+    if (password.length < 6) {
+        res.status(400).json({ ok: false, message: '密码至少6位' });
+        return;
+    }
+
+    try {
+        const countRes = await dbQuery('SELECT COUNT(*)::int AS n FROM app_users');
+        const userCount = Number(countRes.rows[0]?.n || 0);
+        const role = userCount === 0 ? 'admin' : 'operator';
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        const insertRes = await dbQuery(
+            `INSERT INTO app_users (username, password_hash, role)
+             VALUES ($1, $2, $3)
+             RETURNING id, username, role`,
+            [username, passwordHash, role],
+        );
+
+        const user = insertRes.rows[0];
+        const token = issueToken(user);
+        res.json({ ok: true, token, user });
+    } catch (error) {
+        if (String(error?.message || '').includes('duplicate key')) {
+            res.status(409).json({ ok: false, message: '用户名已存在' });
+            return;
+        }
+        log(`register 失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '注册失败' });
+    }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
+
+    const username = String(req.body?.username || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+
+    try {
+        const result = await dbQuery(
+            `SELECT id, username, role, password_hash FROM app_users WHERE username = $1 LIMIT 1`,
+            [username],
+        );
+
+        const user = result.rows[0];
+        if (!user) {
+            res.status(401).json({ ok: false, message: '账号或密码错误' });
+            return;
+        }
+
+        const passOk = await bcrypt.compare(password, user.password_hash);
+        if (!passOk) {
+            res.status(401).json({ ok: false, message: '账号或密码错误' });
+            return;
+        }
+
+        const token = issueToken(user);
+        res.json({
+            ok: true,
+            token,
+            user: { id: user.id, username: user.username, role: user.role },
+        });
+    } catch (error) {
+        log(`login 失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '登录失败' });
+    }
+});
+
+app.get('/api/auth/me', authRequired, async (req, res) => {
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
+
+    try {
+        const result = await dbQuery(
+            `SELECT id, username, role FROM app_users WHERE id = $1 LIMIT 1`,
+            [req.user.sub],
+        );
+        const user = result.rows[0];
+        if (!user) {
+            res.status(401).json({ ok: false, message: '用户不存在' });
+            return;
+        }
+        res.json({ ok: true, user });
+    } catch (error) {
+        log(`me 查询失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '查询用户失败' });
+    }
+});
+
+app.get('/api/routes', authRequired, async (req, res) => {
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
+
+    try {
+        const isAdmin = req.user.role === 'admin';
+        const result = isAdmin
+            ? await dbQuery(
+                  `SELECT id, chat_id, demand_tag, client_ids, owner_user_id, updated_at
+                   FROM customer_routes
+                   ORDER BY updated_at DESC`,
+              )
+            : await dbQuery(
+                  `SELECT id, chat_id, demand_tag, client_ids, owner_user_id, updated_at
+                   FROM customer_routes
+                   WHERE owner_user_id = $1
+                   ORDER BY updated_at DESC`,
+                  [req.user.sub],
+              );
+
+        const items = result.rows.map((row) => ({
+            id: row.id,
+            chatId: row.chat_id,
+            demandTag: row.demand_tag,
+            clientIds: fromClientIdsText(row.client_ids),
+            ownerUserId: row.owner_user_id,
+            updatedAt: row.updated_at,
+        }));
+        res.json({ ok: true, items, availableClientIds: CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID) });
+    } catch (error) {
+        log(`routes 查询失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '查询路由失败' });
+    }
+});
+
+app.post('/api/routes', authRequired, async (req, res) => {
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
+
+    const chatId = String(req.body?.chatId || '').trim();
+    const demandTag = String(req.body?.demandTag || '').trim();
+    const clientIds = parseClientIdList(req.body?.clientIds).filter((id) => id !== MAIN_CLIENT_ID);
+
+    if (!chatId || !demandTag) {
+        res.status(400).json({ ok: false, message: 'chatId 与 demandTag 必填' });
+        return;
+    }
+
+    if (!clientIds.length) {
+        res.status(400).json({ ok: false, message: '至少选择一个筛选账号' });
+        return;
+    }
+
+    try {
+        const existing = await dbQuery(
+            `SELECT id, owner_user_id FROM customer_routes WHERE chat_id = $1 LIMIT 1`,
+            [chatId],
+        );
+
+        if (existing.rows[0]) {
+            const route = existing.rows[0];
+            const canEdit = req.user.role === 'admin' || Number(route.owner_user_id) === Number(req.user.sub);
+            if (!canEdit) {
+                res.status(403).json({ ok: false, message: '无权限修改该路由' });
+                return;
+            }
+
+            await dbQuery(
+                `UPDATE customer_routes
+                 SET demand_tag = $2, client_ids = $3, updated_at = NOW()
+                 WHERE id = $1`,
+                [route.id, demandTag, toClientIdsText(clientIds)],
+            );
+            chatRouteCache.delete(chatId);
+            res.json({ ok: true, id: route.id, updated: true });
+            return;
+        }
+
+        const insertRes = await dbQuery(
+            `INSERT INTO customer_routes (chat_id, demand_tag, client_ids, owner_user_id)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id`,
+            [chatId, demandTag, toClientIdsText(clientIds), req.user.sub],
+        );
+        chatRouteCache.delete(chatId);
+        res.json({ ok: true, id: insertRes.rows[0].id, updated: false });
+    } catch (error) {
+        log(`routes 保存失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '保存路由失败' });
+    }
+});
+
+app.delete('/api/routes/:id', authRequired, async (req, res) => {
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ ok: false, message: '路由ID非法' });
+        return;
+    }
+
+    try {
+        const existing = await dbQuery(
+            `SELECT id, chat_id, owner_user_id FROM customer_routes WHERE id = $1 LIMIT 1`,
+            [id],
+        );
+        const row = existing.rows[0];
+        if (!row) {
+            res.status(404).json({ ok: false, message: '路由不存在' });
+            return;
+        }
+
+        const canDelete = req.user.role === 'admin' || Number(row.owner_user_id) === Number(req.user.sub);
+        if (!canDelete) {
+            res.status(403).json({ ok: false, message: '无权限删除该路由' });
+            return;
+        }
+
+        await dbQuery(`DELETE FROM customer_routes WHERE id = $1`, [id]);
+        chatRouteCache.delete(row.chat_id);
+        res.json({ ok: true });
+    } catch (error) {
+        log(`routes 删除失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '删除路由失败' });
+    }
+});
 
 app.get('/api/state', (_req, res) => {
     res.json(state);
+});
+
+app.post('/api/clients/:clientId/offline', authRequired, async (req, res) => {
+    const { clientId } = req.params;
+    const entry = clientPool.get(clientId);
+
+    if (!entry) {
+        res.status(404).json({ ok: false, message: '账号不存在' });
+        return;
+    }
+
+    if (entry.status === 'manual_offline') {
+        res.json({ ok: true, message: '账号已处于手动下线状态' });
+        return;
+    }
+
+    try {
+        entry.manualOffline = true;
+        await entry.client.destroy().catch(() => {});
+        entry.status = 'manual_offline';
+        setClientState(clientId, {
+            status: 'manual_offline',
+            loading: null,
+            qrDataUrl: null,
+        });
+        log(`[${clientId}] 已手动下线。`);
+        res.json({ ok: true });
+    } catch (error) {
+        log(`[${clientId}] 手动下线失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '手动下线失败' });
+    }
+});
+
+app.post('/api/clients/:clientId/online', authRequired, async (req, res) => {
+    const { clientId } = req.params;
+    const oldEntry = clientPool.get(clientId);
+
+    if (!CLIENT_IDS.includes(clientId)) {
+        res.status(404).json({ ok: false, message: '账号不在配置列表中' });
+        return;
+    }
+
+    try {
+        if (oldEntry) {
+            oldEntry.manualOffline = false;
+            await oldEntry.client.destroy().catch(() => {});
+        }
+
+        const entry = buildClient(clientId);
+        await entry.client.initialize();
+        log(`[${clientId}] 已手动上线，等待就绪。`);
+        res.json({ ok: true });
+    } catch (error) {
+        log(`[${clientId}] 手动上线失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '手动上线失败' });
+    }
 });
 
 io.on('connection', (socket) => {
@@ -754,6 +1473,7 @@ io.on('connection', (socket) => {
     socket.emit('qr', state.qrDataUrl);
     socket.emit('logs', state.logs);
     socket.emit('clients', state.clients);
+    socket.emit('role', state.role);
 });
 const buildClient = (clientId) => {
     const puppeteerConfig = {
@@ -769,8 +1489,17 @@ const buildClient = (clientId) => {
         puppeteerConfig.executablePath = CHROMIUM_PATH;
     }
 
+    const authStrategy = REMOTE_AUTH_ENABLED
+        ? new RemoteAuth({
+              clientId,
+              dataPath: REMOTE_AUTH_DATA_PATH,
+              backupSyncIntervalMs: Math.max(REMOTE_AUTH_BACKUP_INTERVAL_MS, 60000),
+              store: remoteSessionStore,
+          })
+        : new LocalAuth({ clientId, dataPath: AUTH_DIR });
+
     const client = new Client({
-        authStrategy: new LocalAuth({ clientId, dataPath: AUTH_DIR }),
+        authStrategy,
         puppeteer: puppeteerConfig,
     });
 
@@ -778,12 +1507,13 @@ const buildClient = (clientId) => {
         clientId,
         client,
         status: 'starting',
+        manualOffline: false,
     };
     clientPool.set(clientId, entry);
     setClientState(clientId, { status: 'starting' });
 
     client.on('loading_screen', (percent, message) => {
-        if (clientId === CLIENT_IDS[0]) {
+        if (clientId === MAIN_CLIENT_ID) {
             state.loading = { percent, message };
             io.emit('loading', state.loading);
         }
@@ -794,7 +1524,7 @@ const buildClient = (clientId) => {
         entry.status = 'waiting_for_scan';
         setClientState(clientId, { status: 'waiting_for_scan' });
         const qrDataUrl = await QRCode.toDataURL(qr, { width: 320, margin: 1 });
-        if (clientId === CLIENT_IDS[0]) {
+        if (clientId === MAIN_CLIENT_ID) {
             state.qrDataUrl = qrDataUrl;
             io.emit('qr', state.qrDataUrl);
         }
@@ -804,7 +1534,7 @@ const buildClient = (clientId) => {
 
     client.on('authenticated', () => {
         entry.status = 'authenticated';
-        if (clientId === CLIENT_IDS[0]) {
+        if (clientId === MAIN_CLIENT_ID) {
             state.qrDataUrl = null;
             io.emit('qr', null);
         }
@@ -825,15 +1555,24 @@ const buildClient = (clientId) => {
     });
 
     client.on('disconnected', (reason) => {
+        if (entry.manualOffline) {
+            entry.status = 'manual_offline';
+            setClientState(clientId, { status: 'manual_offline' });
+            log(`[${clientId}] 已手动下线。`);
+            return;
+        }
+
         entry.status = 'disconnected';
         setClientState(clientId, { status: 'disconnected' });
         log(`[${clientId}] 连接断开: ${reason}`);
     });
 
-    client.on('message', (msg) => handleCommandMessage(msg, client, clientId));
-    client.on('message_create', (msg) =>
-        handleCommandMessage(msg, client, clientId),
-    );
+    if (clientId === MAIN_CLIENT_ID) {
+        client.on('message', (msg) => handleCommandMessage(msg, client, clientId));
+        client.on('message_create', (msg) =>
+            handleCommandMessage(msg, client, clientId),
+        );
+    }
 
     return entry;
 };
@@ -852,6 +1591,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 
     const chatId = msg.from;
     const chatScopeKey = makeChatScopeKey(currentClientId, chatId);
+    const routeClientIds = await getChatRouteClientIds(chatId).catch(() => null);
 
     if (
         awaitingTxtModeByChat.has(chatScopeKey) &&
@@ -859,7 +1599,15 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
         !msg.body?.startsWith('!')
     ) {
         try {
-            const mode = awaitingTxtModeByChat.get(chatScopeKey);
+            const awaitingConfig = awaitingTxtModeByChat.get(chatScopeKey);
+            const mode =
+                typeof awaitingConfig === 'string'
+                    ? awaitingConfig
+                    : awaitingConfig?.mode;
+            const scopedClientIds =
+                typeof awaitingConfig === 'string'
+                    ? routeClientIds
+                    : awaitingConfig?.routeClientIds || routeClientIds;
             const media = await msg.downloadMedia();
             const filename = media?.filename || 'numbers.txt';
             const isTxt =
@@ -903,34 +1651,52 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                 );
 
                 rows = ['number\tactivity\tack\tchannel\tnote'];
+                let stoppedByDispatcher = false;
                 for (const number of uniqueNumbers) {
                     try {
                         const result = await runWithExecutionClient(
                             currentClientId,
                             (execClient) =>
                                 runProbeForNumber(execClient, number, PROBE_TEXT),
+                            { allowedClientIds: scopedClientIds },
                         );
                         rows.push(
                             `${number}\t${result.activity}\t${
                                 result.ack === null ? 'timeout' : result.ack
                             }\t${result.source}\t${result.note || '-'}`,
                         );
-                    } catch {
+                    } catch (error) {
+                        if (isDispatchUnavailableError(error)) {
+                            stoppedByDispatcher = true;
+                            break;
+                        }
                         rows.push(`${number}\terror\t-\t-\tprobe_failed`);
                     }
                 }
+                if (stoppedByDispatcher) {
+                    rows.push('----\t----\t----\t----\tdispatcher_unavailable_stopped');
+                }
                 resultName = `probe-result-${Date.now()}.txt`;
             } else {
+                if (!getReadyFilterClients(scopedClientIds).length) {
+                    await msg.reply('暂无可用筛选账号，请先上线至少一个筛选账号后重试。');
+                    awaitingTxtModeByChat.delete(chatScopeKey);
+                    log(`checknum 无可用筛选账号: ${chatId}`);
+                    return;
+                }
+
                 await msg.reply(
                     `已收到文件，开始检测 ${numbers.length} 个号码，请稍候...`,
                 );
 
                 const excelRows = [];
+                let stoppedByDispatcher = false;
                 for (const number of numbers) {
                     try {
                         const numberId = await runWithExecutionClient(
                             currentClientId,
                             (execClient) => execClient.getNumberId(number),
+                            { allowedClientIds: scopedClientIds },
                         );
                         const status = numberId ? 'valid' : 'invalid';
                         const waId = numberId?._serialized || `${number}@c.us`;
@@ -943,6 +1709,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                                     currentClientId,
                                     (execClient) =>
                                         execClient.getProfilePicUrl(numberId._serialized),
+                                    { allowedClientIds: scopedClientIds },
                                 );
                                 avatarUrl = maybeAvatar || '';
                                 if (!avatarUrl) {
@@ -962,7 +1729,12 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                             avatarUrl,
                             note,
                         });
-                    } catch {
+                    } catch (error) {
+                        if (isDispatchUnavailableError(error)) {
+                            stoppedByDispatcher = true;
+                            break;
+                        }
+
                         excelRows.push({
                             number,
                             status: 'error',
@@ -973,7 +1745,8 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                     }
                 }
 
-                const workbook = await buildChecknumWorkbook(excelRows);
+                const avatarRows = excelRows.filter((item) => Boolean(item.avatarUrl));
+                const workbook = await buildChecknumWorkbook(avatarRows);
                 resultName = `checknum-result-${Date.now()}.xlsx`;
                 const resultPath = path.join(os.tmpdir(), resultName);
                 await workbook.xlsx.writeFile(resultPath);
@@ -981,12 +1754,18 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                 const resultMedia = MessageMedia.fromFilePath(resultPath);
                 await msg.reply(resultMedia, null, { sendMediaAsDocument: true });
                 await msg.reply(
-                    `检测完成，结果已通过Excel回传（${excelRows.length}条，含头像链接与头像列）。`,
+                    stoppedByDispatcher
+                        ? `筛选账号中途异常，已回传当前成功结果（已处理${excelRows.length}条，仅回传有头像${avatarRows.length}条）。`
+                        : `检测完成，结果已通过Excel回传（共检测${excelRows.length}条，仅回传有头像${avatarRows.length}条）。`,
                 );
 
                 await fs.unlink(resultPath).catch(() => {});
                 awaitingTxtModeByChat.delete(chatScopeKey);
-                log(`checknum Excel处理完成: ${chatId}, 共 ${excelRows.length} 个号码`);
+                log(
+                    stoppedByDispatcher
+                        ? `checknum 部分回传完成: ${chatId}, 已处理 ${excelRows.length} 个号码, 回传有头像 ${avatarRows.length} 个`
+                        : `checknum Excel处理完成: ${chatId}, 检测 ${excelRows.length} 个号码, 回传有头像 ${avatarRows.length} 个`,
+                );
                 return;
             }
 
@@ -996,8 +1775,13 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             const resultMedia = MessageMedia.fromFilePath(resultPath);
             await msg.reply(resultMedia, null, { sendMediaAsDocument: true });
             if (mode === 'probe') {
+                const partialStopped = rows.some((line) =>
+                    line.includes('dispatcher_unavailable_stopped'),
+                );
                 await msg.reply(
-                    `活跃探测完成，结果已通过TXT回传（${rows.length - 1}条）。`,
+                    partialStopped
+                        ? `筛选账号中途异常，已回传当前探测结果（${rows.length - 2}条）。`
+                        : `活跃探测完成，结果已通过TXT回传（${rows.length - 1}条）。`,
                 );
             } else {
                 await msg.reply(`检测完成，结果已通过TXT回传（${numbers.length}条）。`);
@@ -1052,6 +1836,12 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             .map((item) => normalizePhoneInput(item))
             .filter(Boolean);
 
+        if (!getReadyFilterClients(routeClientIds).length) {
+            await msg.reply('暂无可用筛选账号，请先上线至少一个筛选账号再执行批量检测。');
+            log('checknumlist 无可用筛选账号');
+            return;
+        }
+
         if (!numbers.length) {
             await msg.reply('用法: !checknumlist 8613800138000,85251234567');
             log('checknumlist 参数缺失');
@@ -1066,6 +1856,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                 const numberId = await runWithExecutionClient(
                     currentClientId,
                     (execClient) => execClient.getNumberId(number),
+                    { allowedClientIds: routeClientIds },
                 );
                 const status = numberId ? 'valid' : 'invalid';
                 lines.push(`${number} => ${status}`);
@@ -1101,6 +1892,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             const result = await runWithExecutionClient(
                 currentClientId,
                 (execClient) => checkActivityByWsFrames(execClient, number, 4000),
+                { allowedClientIds: routeClientIds },
             );
             if (!result.ok) {
                 await msg.reply(`探测失败: ${result.message}`);
@@ -1150,6 +1942,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                     checkActivityByWsFrames(execClient, number, 9000, {
                         includeDebugFrames: true,
                     }),
+                { allowedClientIds: routeClientIds },
             );
 
             const rows = [
@@ -1215,6 +2008,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             const result = await runWithExecutionClient(
                 currentClientId,
                 (execClient) => checkNumberBehavior(execClient, number, 5000),
+                { allowedClientIds: routeClientIds },
             );
             if (!result.ok) {
                 await msg.reply(`行为检测失败: ${result.message}`);
@@ -1238,7 +2032,10 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
     }
 
     if (msg.body === '!probe') {
-        awaitingTxtModeByChat.set(chatScopeKey, 'probe');
+        awaitingTxtModeByChat.set(chatScopeKey, {
+            mode: 'probe',
+            routeClientIds,
+        });
         await msg.reply(
             '请发送TXT文件（每行一个号码或混排文本均可），我会自动提取号码并回传活跃探测结果TXT。',
         );
@@ -1270,6 +2067,7 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             const result = await runWithExecutionClient(
                 currentClientId,
                 (execClient) => runProbeForNumber(execClient, number, probeText),
+                { allowedClientIds: routeClientIds },
             );
             if (result.activity === 'not_exist') {
                 await msg.reply(
@@ -1304,7 +2102,10 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
     }
 
     if (msg.body.startsWith('!checknum')) {
-        awaitingTxtModeByChat.set(chatScopeKey, 'checknum');
+        awaitingTxtModeByChat.set(chatScopeKey, {
+            mode: 'checknum',
+            routeClientIds,
+        });
         await msg.reply(
             '请发送TXT文件（每行一个号码或混排文本均可），我会自动提取号码并回传含头像的Excel结果。',
         );
@@ -1314,15 +2115,33 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 }
 
 async function start() {
-    await fs.mkdir(AUTH_DIR, { recursive: true });
+    if (REMOTE_AUTH_ENABLED) {
+        await fs.mkdir(REMOTE_AUTH_DATA_PATH, { recursive: true });
+    } else {
+        await fs.mkdir(AUTH_DIR, { recursive: true });
+    }
+
+    await initDatabase().catch((error) => {
+        log(`数据库初始化失败: ${error?.message || error}`);
+    });
+    await initRemoteAuthStore().catch((error) => {
+        throw new Error(`RemoteAuth初始化失败: ${error?.message || error}`);
+    });
 
     server.listen(PORT, HOST, () => {
         log(`可视化页面已启动: http://${HOST}:${PORT}`);
-        log(`会话目录: ${AUTH_DIR}`);
+        log(
+            REMOTE_AUTH_ENABLED
+                ? `会话模式: RemoteAuth(${REMOTE_AUTH_STORE}), 临时目录: ${REMOTE_AUTH_DATA_PATH}`
+                : `会话模式: LocalAuth, 会话目录: ${AUTH_DIR}`,
+        );
         if (CHROMIUM_PATH) {
             log(`Chromium路径: ${CHROMIUM_PATH}`);
         }
+        const filterIds = CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID);
         log(`账号池已配置: ${CLIENT_IDS.join(', ')}`);
+        log(`主机器人账号: ${MAIN_CLIENT_ID}`);
+        log(`筛选账号: ${filterIds.length ? filterIds.join(', ') : '(未配置)'}`);
     });
 
     for (const clientId of CLIENT_IDS) {
@@ -1340,6 +2159,12 @@ async function shutdown() {
         await Promise.allSettled(
             [...clientPool.values()].map((entry) => entry.client.destroy()),
         );
+    } catch {}
+    try {
+        if (dbPool) await dbPool.end();
+    } catch {}
+    try {
+        if (remoteMongoClient) await remoteMongoClient.close();
     } catch {}
     io.close();
     server.close(() => process.exit(0));
