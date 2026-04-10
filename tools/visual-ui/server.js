@@ -1056,6 +1056,35 @@ const resolveProfilePicUrl = async (
     }
 };
 
+const resolveNumberIdWithFallback = async (
+    number,
+    preferredClientId,
+    allowedClientIds = null,
+    primaryClient = null,
+) => {
+    if (!number) return null;
+
+    if (primaryClient) {
+        try {
+            const value = await resolveNumberId(primaryClient, number);
+            if (value) return value;
+        } catch {
+            // fallback to other ready clients below
+        }
+    }
+
+    try {
+        const value = await runWithExecutionClient(
+            preferredClientId,
+            (execClient) => resolveNumberId(execClient, number),
+            { allowedClientIds },
+        );
+        return value || null;
+    } catch {
+        return null;
+    }
+};
+
 const runProbeForNumber = async (clientRef, number, probeText) => {
     const numberId = await resolveNumberId(clientRef, number);
     if (!numberId) {
@@ -2566,7 +2595,12 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 {
                     allowedClientIds,
                     worker: async (execClient, number) => {
-                        const numberId = await resolveNumberId(execClient, number);
+                        const numberId = await resolveNumberIdWithFallback(
+                            number,
+                            preferredClientId,
+                            allowedClientIds,
+                            execClient,
+                        );
                         const status = numberId ? 'valid' : 'invalid';
                         const waId = numberId?._serialized || `${number}@c.us`;
 
