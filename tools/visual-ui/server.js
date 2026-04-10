@@ -1202,16 +1202,11 @@ const ensureMainFilterLink = async (filterEntry) => {
         }
 
         if (AUTO_LINK_FILTER_BOTS) {
-            await Promise.allSettled([
-                mainEntry.client.sendMessage(
-                    mainToFilterId._serialized || `${filterNumber}@c.us`,
-                    AUTO_LINK_TEXT,
-                ),
-                filterEntry.client.sendMessage(
-                    filterToMainId._serialized || `${mainNumber}@c.us`,
-                    AUTO_LINK_TEXT,
-                ),
-            ]);
+            // 风控优化：仅由筛选机器人主动向主机器人发起建联消息
+            await filterEntry.client.sendMessage(
+                filterToMainId._serialized || `${mainNumber}@c.us`,
+                AUTO_LINK_TEXT,
+            );
         }
 
         const result = { ok: true, reason: '' };
