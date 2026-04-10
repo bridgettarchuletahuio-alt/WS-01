@@ -2726,6 +2726,21 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const notRegisteredCount = excelRows.filter((r) => String(r.note || '').includes('not_registered')).length;
             const noAvatarCount = excelRows.filter((r) => String(r.note || '').includes('no_avatar')).length;
             const avatarFetchFailedCount = excelRows.filter((r) => String(r.note || '').includes('avatar_fetch_failed')).length;
+            const registeredCount = Math.max(0, processedCount - notRegisteredCount);
+            const avatarCapabilityLimited =
+                processedCount > 0 &&
+                avatarRows.length === 0 &&
+                registeredCount > 0 &&
+                noAvatarCount >= registeredCount;
+
+            let diagnosticMessage = '';
+            if (avatarCapabilityLimited) {
+                diagnosticMessage =
+                    '当前筛选账号可查注册，但头像接口返回为空（可能是账号风控/权限限制或目标隐私设置）。';
+            } else if (avatarFetchFailedCount > 0) {
+                diagnosticMessage =
+                    `头像抓取接口失败 ${avatarFetchFailedCount} 条，请检查账号在线状态和网络稳定性。`;
+            }
 
             await addDailyProcessedCount(userId, processedCount);
 
@@ -2755,9 +2770,16 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
                 statsByClient: dispatch.statsByClient,
+                diagnostics: {
+                    registeredCount,
+                    notRegisteredCount,
+                    noAvatarCount,
+                    avatarFetchFailedCount,
+                    avatarCapabilityLimited,
+                },
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
-                    : '',
+                    : diagnosticMessage,
                 fileContent: Buffer.from(buffer).toString('base64'),
                 filename: filename,
                 mimeType:

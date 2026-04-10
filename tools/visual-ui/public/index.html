@@ -1552,6 +1552,13 @@
                     metaEl.textContent = '';
                 }
 
+                if (data.message && String(data.message).trim()) {
+                    metaEl.style.display = 'block';
+                    metaEl.textContent = metaEl.textContent
+                        ? `${metaEl.textContent} ｜ ${data.message}`
+                        : String(data.message);
+                }
+
                 // All results are files — build blob URL and show download button
                 const contentBase64 = data.fileContent;
                 if (contentBase64) {
