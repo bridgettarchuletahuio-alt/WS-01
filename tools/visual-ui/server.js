@@ -1251,7 +1251,7 @@ const setClientState = (clientId, patch) => {
 };
 
 app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '8mb' }));
 
 app.post('/api/auth/register', async (req, res) => {
     if (!dbReady) {
@@ -1805,6 +1805,260 @@ app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
     } catch (error) {
         log(`删除账号失败: ${error?.message || error}`);
         res.status(500).json({ ok: false, message: '删除账号失败' });
+    }
+});
+
+// ── UI 任务执行 API ────────────────────────────────────────────────────────
+const VALID_TASK_MODES = ['checknum', 'probe', 'checknumlist', 'activity', 'wsdebug', 'behavior'];
+
+app.post('/api/task/run', authRequired, async (req, res) => {
+    const { mode, numbers, fileContent, clientId: preferredClientId } = req.body || {};
+    const userId = req.user.sub;
+    const userRole = req.user.role;
+
+    if (!VALID_TASK_MODES.includes(mode)) {
+        res.status(400).json({ ok: false, message: '无效的任务模式' });
+        return;
+    }
+
+    // 解析号码
+    let parsedNumbers = [];
+    if (fileContent) {
+        try {
+            const buffer = Buffer.from(String(fileContent), 'base64');
+            parsedNumbers = extractPhoneNumbersFromBuffer(buffer);
+        } catch {
+            res.status(400).json({ ok: false, message: 'TXT文件解析失败' });
+            return;
+        }
+    } else if (Array.isArray(numbers)) {
+        parsedNumbers = numbers
+            .map((n) => normalizePhoneInput(String(n || '')))
+            .filter(Boolean);
+    } else if (typeof numbers === 'string' && numbers.trim()) {
+        parsedNumbers = extractPhoneNumbers(numbers);
+    }
+
+    if (!parsedNumbers.length) {
+        res.status(400).json({ ok: false, message: '未能提取到有效电话号码，请检查格式' });
+        return;
+    }
+
+    // 确定该用户可用的筛选账号
+    const allowedClientIds =
+        userRole === 'admin'
+            ? null
+            : [...(userClientMap.get(Number(userId)) || new Set())];
+
+    try {
+        if (mode === 'checknum') {
+            const numbers2 = parsedNumbers.slice(0, 500);
+            const excelRows = [];
+            let stoppedEarly = false;
+
+            for (const number of numbers2) {
+                try {
+                    const numberId = await runWithExecutionClient(
+                        preferredClientId,
+                        (execClient) => execClient.getNumberId(number),
+                        { allowedClientIds },
+                    );
+                    const status = numberId ? 'valid' : 'invalid';
+                    const waId = numberId?._serialized || `${number}@c.us`;
+
+                    let avatarUrl = '';
+                    let note = '';
+                    if (numberId?._serialized) {
+                        try {
+                            const maybeAvatar = await runWithExecutionClient(
+                                preferredClientId,
+                                (execClient) =>
+                                    execClient.getProfilePicUrl(numberId._serialized),
+                                { allowedClientIds },
+                            );
+                            avatarUrl = maybeAvatar || '';
+                            if (!avatarUrl) note = 'no_avatar';
+                        } catch {
+                            note = 'avatar_fetch_failed';
+                        }
+                    } else {
+                        note = 'not_registered';
+                    }
+
+                    excelRows.push({ number, status, waId, avatarUrl, note });
+                } catch (error) {
+                    if (isDispatchUnavailableError(error)) {
+                        stoppedEarly = true;
+                        break;
+                    }
+                    excelRows.push({ number, status: 'error', waId: '-', avatarUrl: '', note: error?.message || 'check_failed' });
+                }
+            }
+
+            const workbook = await buildChecknumWorkbook(excelRows);
+            const buffer = await workbook.xlsx.writeBuffer();
+            log(`[task/checknum] 用户 ${req.user.username} 完成，共 ${excelRows.length} 条${stoppedEarly ? '（提前中止）' : ''}`);
+            res.json({
+                ok: true,
+                mode,
+                count: excelRows.length,
+                stoppedEarly,
+                fileContent: Buffer.from(buffer).toString('base64'),
+                filename: `checknum_${Date.now()}.xlsx`,
+                mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            });
+
+        } else if (mode === 'probe') {
+            const numbers2 = [...new Set(parsedNumbers)].slice(0, 80);
+            const rows = ['number\tactivity\tack\tchannel\tnote'];
+            let stoppedEarly = false;
+
+            for (const number of numbers2) {
+                try {
+                    const result = await runWithExecutionClient(
+                        preferredClientId,
+                        (execClient) => runProbeForNumber(execClient, number, PROBE_TEXT),
+                        { allowedClientIds },
+                    );
+                    rows.push(
+                        `${result.number}\t${result.activity}\t${result.ack === null ? 'timeout' : result.ack}\t${result.source}\t${result.note || '-'}`,
+                    );
+                } catch (error) {
+                    if (isDispatchUnavailableError(error)) {
+                        stoppedEarly = true;
+                        break;
+                    }
+                    rows.push(`${number}\terror\t-\t-\tprobe_failed`);
+                }
+            }
+
+            const text = rows.join('\n');
+            log(`[task/probe] 用户 ${req.user.username} 完成，共 ${rows.length - 1} 条${stoppedEarly ? '（提前中止）' : ''}`);
+            res.json({
+                ok: true,
+                mode,
+                count: rows.length - 1,
+                stoppedEarly,
+                fileContent: Buffer.from(text).toString('base64'),
+                filename: `probe_${Date.now()}.txt`,
+                mimeType: 'text/plain',
+            });
+
+        } else if (mode === 'checknumlist') {
+            const numbers2 = parsedNumbers.slice(0, 500);
+            const resultLines = [];
+            let stoppedEarly = false;
+
+            for (const number of numbers2) {
+                try {
+                    const numberId = await runWithExecutionClient(
+                        preferredClientId,
+                        (execClient) => execClient.getNumberId(number),
+                        { allowedClientIds },
+                    );
+                    const waId = numberId?._serialized || '';
+                    resultLines.push(`${number}\t${numberId ? 'registered' : 'unregistered'}\t${waId}`);
+                } catch (error) {
+                    if (isDispatchUnavailableError(error)) {
+                        stoppedEarly = true;
+                        break;
+                    }
+                    resultLines.push(`${number}\terror\t${error?.message || 'failed'}`);
+                }
+            }
+
+            log(`[task/checknumlist] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
+            res.json({ ok: true, mode, count: resultLines.length, stoppedEarly, text: resultLines.join('\n') });
+
+        } else if (mode === 'activity') {
+            const numbers2 = parsedNumbers.slice(0, 20);
+            const resultLines = [];
+            let stoppedEarly = false;
+
+            for (const number of numbers2) {
+                try {
+                    const r = await runWithExecutionClient(
+                        preferredClientId,
+                        (execClient) => checkActivityByWsFrames(execClient, number, 5000),
+                        { allowedClientIds },
+                    );
+                    resultLines.push(
+                        `${r.number}\t${r.state}\tframes=${r.frameCount}\tkeyword=${r.keywordHits}\tsvc=${r.serviceHits}\t${r.sample ? r.sample.slice(0, 100) : '-'}`,
+                    );
+                } catch (error) {
+                    if (isDispatchUnavailableError(error)) {
+                        stoppedEarly = true;
+                        break;
+                    }
+                    resultLines.push(`${number}\terror\t${error?.message || 'failed'}`);
+                }
+            }
+
+            log(`[task/activity] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
+            res.json({ ok: true, mode, count: resultLines.length, stoppedEarly, text: resultLines.join('\n') });
+
+        } else if (mode === 'wsdebug') {
+            const number = parsedNumbers[0];
+            const r = await runWithExecutionClient(
+                preferredClientId,
+                (execClient) => checkActivityByWsFrames(execClient, number, 5000, { includeDebugFrames: true }),
+                { allowedClientIds },
+            );
+            const lines = [
+                `号码: ${r.number}`,
+                `状态: ${r.state}`,
+                `总帧数: ${r.totalFrames} / 已解码: ${r.decodedFrames}`,
+                `关键词命中: ${r.keywordHits} / 服务命中: ${r.serviceHits} / 服务解码: ${r.serviceDecoded}`,
+                `服务状态: ${r.serviceStatus}`,
+                '',
+                '---- 帧调试信息 ----',
+                ...(r.debugFrames || []),
+            ];
+            const text = lines.join('\n');
+            log(`[task/wsdebug] 用户 ${req.user.username} 完成: ${number}`);
+            res.json({
+                ok: true,
+                mode,
+                count: 1,
+                fileContent: Buffer.from(text).toString('base64'),
+                filename: `wsdebug_${number}_${Date.now()}.txt`,
+                mimeType: 'text/plain',
+            });
+
+        } else if (mode === 'behavior') {
+            const numbers2 = parsedNumbers.slice(0, 20);
+            const resultLines = [];
+            let stoppedEarly = false;
+
+            for (const number of numbers2) {
+                try {
+                    const r = await runWithExecutionClient(
+                        preferredClientId,
+                        (execClient) => checkNumberBehavior(execClient, number, 5000),
+                        { allowedClientIds },
+                    );
+                    resultLines.push(
+                        `${r.number || number}\t${r.behavior || (r.ok ? 'ok' : 'error')}\t${r.message || '-'}`,
+                    );
+                } catch (error) {
+                    if (isDispatchUnavailableError(error)) {
+                        stoppedEarly = true;
+                        break;
+                    }
+                    resultLines.push(`${number}\terror\t${error?.message || 'failed'}`);
+                }
+            }
+
+            log(`[task/behavior] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
+            res.json({ ok: true, mode, count: resultLines.length, stoppedEarly, text: resultLines.join('\n') });
+        }
+    } catch (error) {
+        log(`任务执行失败 [${mode}]: ${error?.message || error}`);
+        if (isDispatchUnavailableError(error)) {
+            res.status(503).json({ ok: false, message: error.message });
+        } else {
+            res.status(500).json({ ok: false, message: error?.message || '任务执行失败' });
+        }
     }
 });
 

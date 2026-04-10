@@ -366,6 +366,72 @@
                 border-color: #fecaca;
             }
 
+            /* 任务执行面板 */
+            .task-panel-card {
+                margin-top: 16px;
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 12px 25px rgba(15, 23, 42, 0.06);
+            }
+            .task-mode-tabs {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin-bottom: 12px;
+            }
+            .task-mode-btn {
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                padding: 5px 14px;
+                font-size: 13px;
+                background: #fff;
+                color: #374151;
+                cursor: pointer;
+            }
+            .task-mode-btn.active {
+                background: #0f766e;
+                color: #fff;
+                border-color: #0f766e;
+            }
+            .task-input-area {
+                display: grid;
+                gap: 8px;
+                margin-bottom: 10px;
+            }
+            .task-result-box {
+                margin-top: 12px;
+                display: none;
+            }
+            .task-result-box.visible {
+                display: block;
+            }
+            .task-result-text {
+                max-height: 260px;
+                overflow: auto;
+                padding: 10px;
+                border-radius: 10px;
+                background: #1f2937;
+                color: #f9fafb;
+                font-family: "JetBrains Mono", monospace;
+                font-size: 12px;
+                white-space: pre-wrap;
+                word-break: break-all;
+            }
+            .task-download-btn {
+                margin-top: 8px;
+                display: inline-block;
+                background: #0f766e;
+                color: #fff;
+                border: none;
+                border-radius: 8px;
+                padding: 7px 16px;
+                font-size: 13px;
+                cursor: pointer;
+                text-decoration: none;
+            }
+
             @media (max-width: 900px) {
                 .grid {
                     grid-template-columns: 1fr;
@@ -474,6 +540,50 @@
                         </thead>
                         <tbody id="users-body"></tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- 任务执行面板（所有用户可用） -->
+            <div class="task-panel-card">
+                <h3 style="margin:0 0 4px">任务执行</h3>
+                <p class="muted" style="margin:0 0 12px;font-size:13px">直接在界面发起号码检测任务，无需通过 WhatsApp 发送命令。</p>
+
+                <!-- 模式选择 -->
+                <div class="task-mode-tabs" id="task-mode-tabs">
+                    <button class="task-mode-btn active" data-mode="checknum" title="检测号码是否注册+头像，返回 Excel">号码检测 (checknum)</button>
+                    <button class="task-mode-btn" data-mode="checknumlist" title="批量检测是否注册，返回文本">批量注册查询</button>
+                    <button class="task-mode-btn" data-mode="probe" title="发送探测消息检测活跃度，返回 TXT（最多80个）">活跃探测 (probe)</button>
+                    <button class="task-mode-btn" data-mode="activity" title="通过 WS 帧分析活跃度（最多20个）">WS帧活跃分析</button>
+                    <button class="task-mode-btn" data-mode="wsdebug" title="WS帧调试（仅第一个号码）">WS帧调试</button>
+                    <button class="task-mode-btn" data-mode="behavior" title="页面行为检测（最多20个）">页面行为检测</button>
+                </div>
+
+                <!-- 输入区 -->
+                <div class="task-input-area">
+                    <div id="task-file-row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                        <label style="font-size:13px;color:#374151;white-space:nowrap">上传 TXT 文件：</label>
+                        <input type="file" id="task-file-input" accept=".txt,text/plain" style="font-size:13px" />
+                        <span class="muted" style="font-size:12px">或在下方直接输入号码</span>
+                    </div>
+                    <textarea id="task-numbers-input" class="input" rows="4"
+                        placeholder="每行/逗号/空格分隔均可，例如：&#10;8613912345678&#10;8613800000000"
+                        style="resize:vertical;font-family:'JetBrains Mono',monospace;font-size:13px"></textarea>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                        <label style="font-size:13px;color:#374151">优先使用账号：</label>
+                        <select id="task-client-select" style="border:1px solid #e5dccf;border-radius:8px;padding:6px 10px;background:#fff;font-size:13px">
+                            <option value="">自动选择</option>
+                        </select>
+                        <button id="task-run-btn" class="btn btn-primary">▶ 执行任务</button>
+                        <span id="task-status-text" style="font-size:13px;color:#6b7280"></span>
+                    </div>
+                    <div id="task-error" class="error"></div>
+                </div>
+
+                <!-- 结果展示 -->
+                <div class="task-result-box" id="task-result-box">
+                    <div style="font-size:13px;color:#374151;margin-bottom:6px" id="task-result-summary"></div>
+                    <pre class="task-result-text" id="task-result-text" style="display:none"></pre>
+                    <a class="task-download-btn" id="task-download-btn" style="display:none" download>⬇ 下载结果文件</a>
                 </div>
             </div>
         </div>
@@ -1049,9 +1159,157 @@
             socket.on('clients', (clients) => {
                 clientsState = clients || {};
                 renderClients();
+                renderTaskClientSelect();
             });
 
             socket.on('log', (line) => pushLog(line));
+
+            // ── 任务执行面板 ──────────────────────────────────────────────
+            let taskMode = 'checknum';
+
+            const taskModeDescriptions = {
+                checknum: '检测号码是否注册 WA + 获取头像，结果返回 Excel 文件（最多 500 个）',
+                checknumlist: '批量检测号码是否注册，结果显示在页面（最多 500 个）',
+                probe: '发送探测消息检测活跃度（最多 80 个），结果返回 TXT 文件',
+                activity: '通过 WS 帧分析号码活跃状态（最多 20 个），每号耗时约 10-15 秒',
+                wsdebug: 'WS 帧详细调试（仅第一个号码），用于排查分析',
+                behavior: '通过页面行为检测号码有效性（最多 20 个）',
+            };
+
+            document.querySelectorAll('.task-mode-btn').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    taskMode = btn.dataset.mode;
+                    document.querySelectorAll('.task-mode-btn').forEach((b) => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    document.getElementById('task-error').textContent = '';
+                    document.getElementById('task-status-text').textContent = taskModeDescriptions[taskMode] || '';
+                    clearTaskResult();
+                });
+            });
+
+            const renderTaskClientSelect = () => {
+                const sel = document.getElementById('task-client-select');
+                const prev = sel.value;
+                // keep first "自动选择" option, remove the rest
+                while (sel.options.length > 1) sel.remove(1);
+                Object.keys(clientsState).forEach((cid) => {
+                    const opt = document.createElement('option');
+                    opt.value = cid;
+                    opt.textContent = `${cid} (${clientsState[cid]?.status || '?'})`;
+                    sel.appendChild(opt);
+                });
+                if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+            };
+
+            const clearTaskResult = () => {
+                const box = document.getElementById('task-result-box');
+                box.classList.remove('visible');
+                document.getElementById('task-result-summary').textContent = '';
+                document.getElementById('task-result-text').style.display = 'none';
+                document.getElementById('task-result-text').textContent = '';
+                document.getElementById('task-download-btn').style.display = 'none';
+            };
+
+            const showTaskResult = (data) => {
+                const box = document.getElementById('task-result-box');
+                const summary = document.getElementById('task-result-summary');
+                const textEl = document.getElementById('task-result-text');
+                const dlBtn = document.getElementById('task-download-btn');
+
+                box.classList.add('visible');
+
+                const stopped = data.stoppedEarly ? '（筛选账号中途不可用，提前中止）' : '';
+                summary.textContent = `完成：共处理 ${data.count} 条${stopped}`;
+
+                if (data.fileContent) {
+                    const mime = data.mimeType || 'application/octet-stream';
+                    const byteChars = atob(data.fileContent);
+                    const byteArr = new Uint8Array(byteChars.length);
+                    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+                    const blob = new Blob([byteArr], { type: mime });
+                    const url = URL.createObjectURL(blob);
+                    dlBtn.href = url;
+                    dlBtn.download = data.filename || 'result';
+                    dlBtn.style.display = 'inline-block';
+                    dlBtn.textContent = `⬇ 下载 ${data.filename || '结果文件'}`;
+                    textEl.style.display = 'none';
+                }
+
+                if (data.text) {
+                    textEl.style.display = 'block';
+                    textEl.textContent = data.text;
+                    // Also offer download for text results
+                    const blob = new Blob([data.text], { type: 'text/plain;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    dlBtn.href = url;
+                    dlBtn.download = `${data.mode}_${Date.now()}.txt`;
+                    dlBtn.style.display = 'inline-block';
+                    dlBtn.textContent = '⬇ 下载结果 TXT';
+                }
+            };
+
+            document.getElementById('task-run-btn').addEventListener('click', async () => {
+                const runBtn = document.getElementById('task-run-btn');
+                const statusText = document.getElementById('task-status-text');
+                const errEl = document.getElementById('task-error');
+                const fileInput = document.getElementById('task-file-input');
+                const numbersInput = document.getElementById('task-numbers-input');
+                const clientSelect = document.getElementById('task-client-select');
+
+                errEl.textContent = '';
+                clearTaskResult();
+
+                const body = { mode: taskMode, clientId: clientSelect.value || undefined };
+
+                // Try file first
+                if (fileInput.files && fileInput.files.length > 0) {
+                    const file = fileInput.files[0];
+                    if (file.size > 6 * 1024 * 1024) {
+                        errEl.textContent = '文件过大，请上传 6MB 以内的 TXT 文件';
+                        return;
+                    }
+                    try {
+                        const arrayBuf = await file.arrayBuffer();
+                        const bytes = new Uint8Array(arrayBuf);
+                        let binary = '';
+                        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+                        body.fileContent = btoa(binary);
+                    } catch {
+                        errEl.textContent = '文件读取失败，请重试';
+                        return;
+                    }
+                } else if (numbersInput.value.trim()) {
+                    body.numbers = numbersInput.value;
+                } else {
+                    errEl.textContent = '请上传 TXT 文件或在文本框输入号码';
+                    return;
+                }
+
+                runBtn.disabled = true;
+                runBtn.textContent = '执行中...';
+                statusText.textContent = '任务运行中，请耐心等待...';
+
+                try {
+                    const resp = await authFetch('/api/task/run', {
+                        method: 'POST',
+                        body: JSON.stringify(body),
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok || !data.ok) {
+                        errEl.textContent = data.message || '执行失败，请检查账号状态';
+                        statusText.textContent = '';
+                        return;
+                    }
+                    statusText.textContent = '执行完成';
+                    showTaskResult(data);
+                } catch (err) {
+                    errEl.textContent = '网络异常，请重试';
+                    statusText.textContent = '';
+                } finally {
+                    runBtn.disabled = false;
+                    runBtn.textContent = '▶ 执行任务';
+                }
+            });
 
             (async () => {
                 const ok = await ensureAuth();
