@@ -1089,6 +1089,40 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
         }
         return '';
     };
+    const resolveAvatarViaPageStore = async (candidateJid) => {
+        try {
+            const page = clientRef?.pupPage;
+            if (!page || typeof page.evaluate !== 'function') return '';
+
+            const url = await page.evaluate((targetJid) => {
+                try {
+                    const store = window.Store || {};
+                    const contactStore = store.Contact || store.Contacts || null;
+                    const byId = contactStore && typeof contactStore.get === 'function'
+                        ? contactStore.get(targetJid)
+                        : null;
+                    const model = byId || null;
+                    if (!model) return '';
+
+                    const pic = model.profilePicThumbObj || (model._data && model._data.profilePicThumbObj) || null;
+                    if (!pic) return '';
+
+                    const cands = [pic.eurl, pic.imgFull, pic.img];
+                    for (const c of cands) {
+                        const v = String(c || '').trim();
+                        if (/^https?:\/\//i.test(v)) return v;
+                    }
+                    return '';
+                } catch (_) {
+                    return '';
+                }
+            }, candidateJid);
+
+            return pickHttpUrl(url);
+        } catch {
+            return '';
+        }
+    };
     const jidCandidates = [];
     const pushCandidate = (id) => {
         const v = String(id || '').trim();
@@ -1158,6 +1192,21 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
                 lastError = String(e?.message || e || '')
                     .replace(/[\r\n\t]+/g, ' ')
                     .slice(0, 80);
+            }
+
+            try {
+                // Path C: browser page store fallback (same account only)
+                const urlC = await resolveAvatarViaPageStore(candidateJid);
+                if (urlC) {
+                    return {
+                        url: urlC,
+                        note: '',
+                        attempts: i + 1,
+                    };
+                }
+                lastNullFrom = 'store';
+            } catch {
+                // keep lastError from API paths; store fallback failures are non-fatal
             }
         }
 
