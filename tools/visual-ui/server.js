@@ -1062,38 +1062,68 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
         return { url: '', note: 'avatar_client_unavailable', attempts: 0 };
     }
 
+    const raw = String(jid || '');
+    const userPart = raw.split('@')[0] || '';
+    const jidCandidates = [];
+    const pushCandidate = (id) => {
+        const v = String(id || '').trim();
+        if (!v) return;
+        if (!jidCandidates.includes(v)) jidCandidates.push(v);
+    };
+    pushCandidate(raw);
+    if (userPart) {
+        pushCandidate(`${userPart}@c.us`);
+        pushCandidate(`${userPart}@s.whatsapp.net`);
+    }
+
     let lastError = '';
     let lastNullFrom = 'client';
+    let lastTriedJid = jidCandidates[0] || raw;
     for (let i = 0; i < 4; i++) {
-        try {
-            // Path A: direct client API
-            const urlA = await clientRef.getProfilePicUrl(jid);
-            if (urlA) {
-                return { url: urlA, note: '', attempts: i + 1 };
-            }
-            lastNullFrom = 'client';
-        } catch (e) {
-            lastError = String(e?.message || e || '')
-                .replace(/[\r\n\t]+/g, ' ')
-                .slice(0, 80);
-        }
+        for (const candidateJid of jidCandidates) {
+            lastTriedJid = candidateJid;
 
-        try {
-            // Path B: contact API (same account, alternate WA path)
-            if (typeof clientRef.getContactById === 'function') {
-                const contact = await clientRef.getContactById(jid);
-                if (contact && typeof contact.getProfilePicUrl === 'function') {
-                    const urlB = await contact.getProfilePicUrl();
-                    if (urlB) {
-                        return { url: urlB, note: '', attempts: i + 1 };
-                    }
-                    lastNullFrom = 'contact';
+            try {
+                // Path A: direct client API
+                const urlA = await clientRef.getProfilePicUrl(candidateJid);
+                if (urlA) {
+                    return {
+                        url: urlA,
+                        note: '',
+                        attempts: i + 1,
+                    };
                 }
+                lastNullFrom = 'client';
+            } catch (e) {
+                lastError = String(e?.message || e || '')
+                    .replace(/[\r\n\t]+/g, ' ')
+                    .slice(0, 80);
             }
-        } catch (e) {
-            lastError = String(e?.message || e || '')
-                .replace(/[\r\n\t]+/g, ' ')
-                .slice(0, 80);
+
+            try {
+                // Path B: contact API (same account, alternate WA path)
+                if (typeof clientRef.getContactById === 'function') {
+                    const contact = await clientRef.getContactById(candidateJid);
+                    if (
+                        contact &&
+                        typeof contact.getProfilePicUrl === 'function'
+                    ) {
+                        const urlB = await contact.getProfilePicUrl();
+                        if (urlB) {
+                            return {
+                                url: urlB,
+                                note: '',
+                                attempts: i + 1,
+                            };
+                        }
+                        lastNullFrom = 'contact';
+                    }
+                }
+            } catch (e) {
+                lastError = String(e?.message || e || '')
+                    .replace(/[\r\n\t]+/g, ' ')
+                    .slice(0, 80);
+            }
         }
 
         if (i < 3) await sleep(220 + i * 240);
@@ -1102,14 +1132,14 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
     if (lastError) {
         return {
             url: '',
-            note: `avatar_fetch_failed:${lastError}`,
+            note: `avatar_fetch_failed:${lastError}|jid=${lastTriedJid}`,
             attempts: 4,
         };
     }
 
     return {
         url: '',
-        note: `no_avatar_or_privacy:${lastNullFrom}`,
+        note: `no_avatar_or_privacy:${lastNullFrom}|jid=${lastTriedJid}`,
         attempts: 4,
     };
 };
