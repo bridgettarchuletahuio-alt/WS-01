@@ -1357,6 +1357,17 @@
                     });
                     const data = await resp.json().catch(() => ({}));
                     if (!resp.ok || !data.ok) {
+                        // 某些中断场景后端会携带可下载的部分结果文件
+                        if (data && data.fileContent) {
+                            statusText.textContent = '任务中断，已生成部分结果';
+                            errEl.textContent = data.message || '任务中断，已返回部分结果文件';
+                            showTaskResult({
+                                ...data,
+                                ok: true,
+                                stoppedEarly: true,
+                            });
+                            return;
+                        }
                         errEl.textContent = data.message || '执行失败，请检查账号状态';
                         statusText.textContent = '';
                         return;

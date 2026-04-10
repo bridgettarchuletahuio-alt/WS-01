@@ -699,6 +699,15 @@ const buildSimpleWorkbook = async (sheetName, headers, rows) => {
     return workbook;
 };
 
+const buildInterruptedTaskWorkbook = async (mode, message, inputCount = 0) => {
+    const workbook = await buildSimpleWorkbook(
+        `${mode || 'task'}_interrupted`,
+        ['mode', 'status', 'processed_count', 'message'],
+        [[mode || '-', 'stopped_early', String(inputCount || 0), message || '筛选账号异常中止']],
+    );
+    return workbook;
+};
+
 const isMostlyPrintable = (text) => {
     if (!text) return false;
     let printable = 0;
@@ -2730,7 +2739,52 @@ app.post('/api/task/run', authRequired, async (req, res) => {
     } catch (error) {
         log(`任务执行失败 [${mode}]: ${error?.message || error}`);
         if (isDispatchUnavailableError(error)) {
-            res.status(503).json({ ok: false, message: error.message });
+            try {
+                const fallbackWorkbook = await buildInterruptedTaskWorkbook(
+                    mode,
+                    error?.message || '筛选账号异常中止',
+                    Array.isArray(parsedNumbers) ? parsedNumbers.length : 0,
+                );
+                const fallbackBuffer = Buffer.from(
+                    await fallbackWorkbook.xlsx.writeBuffer(),
+                );
+                const fallbackFilename = `${mode || 'task'}_partial_${Date.now()}.xlsx`;
+
+                const inputFileContent = fileContent
+                    ? Buffer.from(fileContent, 'base64').toString('utf-8')
+                    : Array.isArray(parsedNumbers)
+                      ? parsedNumbers.join('\n')
+                      : '';
+
+                await saveTaskHistory(
+                    userId,
+                    mode || 'unknown',
+                    Array.isArray(parsedNumbers) ? parsedNumbers.length : 0,
+                    0,
+                    true,
+                    Buffer.from(inputFileContent),
+                    fallbackBuffer,
+                    fallbackFilename,
+                );
+
+                res.json({
+                    ok: true,
+                    mode,
+                    count: 0,
+                    processedCount: 0,
+                    stoppedEarly: true,
+                    message: error?.message || '筛选账号异常中止，已生成部分结果文件',
+                    fileContent: fallbackBuffer.toString('base64'),
+                    filename: fallbackFilename,
+                    mimeType:
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                });
+            } catch (fallbackError) {
+                log(
+                    `[task/fallback-error] ${fallbackError?.message || fallbackError}`,
+                );
+                res.status(503).json({ ok: false, message: error.message });
+            }
         } else {
             res.status(500).json({
                 ok: false,
