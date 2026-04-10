@@ -339,6 +339,33 @@
                 margin-left: 4px;
             }
 
+            /* 添加账号表单 */
+            #add-client-area {
+                display: none;
+                margin-bottom: 12px;
+            }
+            #add-client-area.visible {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            #add-client-area .input {
+                flex: 1;
+                min-width: 160px;
+            }
+            .client-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 8px;
+            }
+            .btn-danger {
+                background: #fef2f2;
+                color: #b42318;
+                border-color: #fecaca;
+            }
+
             @media (max-width: 900px) {
                 .grid {
                     grid-template-columns: 1fr;
@@ -364,6 +391,15 @@
                         <div id="qr-empty" class="muted">等待二维码...</div>
                     </div>
                     <div class="loading" id="loading">加载状态: -</div>
+                    <div class="client-header">
+                        <span style="font-size:13px;color:#6b7280">账号列表</span>
+                        <button id="show-add-client-btn" class="btn btn-primary" style="display:none;font-size:12px;padding:4px 10px">+ 添加账号</button>
+                    </div>
+                    <div id="add-client-area">
+                        <input id="new-client-id" class="input" placeholder="账号ID，如 filter-bot-2" />
+                        <button id="confirm-add-client-btn" class="btn btn-primary">确认添加</button>
+                        <button id="cancel-add-client-btn" class="btn">取消</button>
+                    </div>
                     <div class="clients" id="clients"></div>
                     <p class="muted">
                         登录后请用另一个账号给机器人发送 !ping，若自动回复 pong 说明功能正常。
@@ -441,6 +477,11 @@
             const saveRouteBtn = document.getElementById('save-route-btn');
             const routeErrorEl = document.getElementById('route-error');
             const routesBodyEl = document.getElementById('routes-body');
+            const showAddClientBtn = document.getElementById('show-add-client-btn');
+            const addClientArea = document.getElementById('add-client-area');
+            const newClientIdInput = document.getElementById('new-client-id');
+            const confirmAddClientBtn = document.getElementById('confirm-add-client-btn');
+            const cancelAddClientBtn = document.getElementById('cancel-add-client-btn');
 
             const socket = io();
             let clientsState = {};
@@ -504,6 +545,7 @@
                     userBadgeEl.textContent = `${data.user.username} (${data.user.role})`;
                     if (data.user.role === 'admin') {
                         document.getElementById('user-mgmt-section').classList.add('visible');
+                        showAddClientBtn.style.display = '';
                         await loadUsers();
                     }
                     return true;
@@ -658,6 +700,23 @@
                     actions.appendChild(onlineBtn);
                     actions.appendChild(offlineBtn);
 
+                    // 仅 admin 且非主机器人显示删除按钮
+                    if (currentUser?.role === 'admin' && clientId !== roleState.mainClientId) {
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.className = 'btn btn-danger';
+                        deleteBtn.textContent = '删除账号';
+                        deleteBtn.addEventListener('click', async () => {
+                            if (!confirm(`确定要永久删除账号 ${clientId} 吗？此操作不可撤销。`)) return;
+                            const resp = await authFetch(`/api/clients/${encodeURIComponent(clientId)}`, { method: 'DELETE' });
+                            const data = await resp.json().catch(() => ({}));
+                            if (!resp.ok) {
+                                alert(data.message || '删除失败');
+                            }
+                            await loadRoutes();
+                        });
+                        actions.appendChild(deleteBtn);
+                    }
+
                     item.appendChild(top);
                     item.appendChild(statusInfo);
                     item.appendChild(actions);
@@ -781,6 +840,39 @@
             logoutBtn.addEventListener('click', () => {
                 localStorage.removeItem(tokenKey);
                 window.location.href = '/auth.html';
+            });
+
+            // 添加账号事件
+            showAddClientBtn.addEventListener('click', () => {
+                addClientArea.classList.add('visible');
+                newClientIdInput.value = '';
+                newClientIdInput.focus();
+            });
+            cancelAddClientBtn.addEventListener('click', () => {
+                addClientArea.classList.remove('visible');
+            });
+            confirmAddClientBtn.addEventListener('click', async () => {
+                const clientId = newClientIdInput.value.trim();
+                if (!clientId) return;
+                confirmAddClientBtn.disabled = true;
+                confirmAddClientBtn.textContent = '添加中...';
+                try {
+                    const resp = await authFetch('/api/clients', {
+                        method: 'POST',
+                        body: JSON.stringify({ clientId }),
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok) {
+                        alert(data.message || '添加失败');
+                    } else {
+                        addClientArea.classList.remove('visible');
+                        newClientIdInput.value = '';
+                        await loadRoutes();
+                    }
+                } finally {
+                    confirmAddClientBtn.disabled = false;
+                    confirmAddClientBtn.textContent = '确认添加';
+                }
             });
 
             socket.on('status', (status) => {

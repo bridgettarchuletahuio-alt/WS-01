@@ -326,6 +326,32 @@ const initDatabase = async () => {
         `CREATE INDEX IF NOT EXISTS idx_customer_routes_owner ON customer_routes(owner_user_id)`,
     );
 
+    // ── managed_clients：持久化动态添加的账号列表 ──────────────────────────
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS managed_clients (
+            id SERIAL PRIMARY KEY,
+            client_id VARCHAR(128) UNIQUE NOT NULL,
+            is_main BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+    );
+    // 把环境变量里的账号 upsert 进表（首次运行时种入）
+    for (const cid of [...CLIENT_IDS]) {
+        await dbQuery(
+            `INSERT INTO managed_clients (client_id, is_main)
+             VALUES ($1, $2)
+             ON CONFLICT (client_id) DO NOTHING`,
+            [cid, cid === MAIN_CLIENT_ID],
+        );
+    }
+    // 加载 DB 中额外添加的账号（不在环境变量里的）
+    const mcRes = await dbQuery(`SELECT client_id FROM managed_clients ORDER BY id ASC`);
+    for (const row of mcRes.rows) {
+        if (!CLIENT_IDS.includes(row.client_id)) {
+            CLIENT_IDS.push(row.client_id);
+        }
+    }
+
     dbReady = true;
     log('PostgreSQL 已连接，注册与客户路由功能已启用。');
 };
@@ -1543,6 +1569,88 @@ app.post('/api/clients/:clientId/online', authRequired, async (req, res) => {
     } catch (error) {
         log(`[${clientId}] 手动上线失败: ${error?.message || error}`);
         res.status(500).json({ ok: false, message: '手动上线失败' });
+    }
+});
+
+// ── 动态添加账号（admin） ────────────────────────────────────────────────
+app.post('/api/clients', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+
+    const clientId = String(req.body?.clientId || '').trim();
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(clientId)) {
+        res.status(400).json({ ok: false, message: '账号ID只能包含字母/数字/下划线/横线，长度2-64' });
+        return;
+    }
+    if (clientPool.has(clientId)) {
+        res.status(409).json({ ok: false, message: '该账号ID已存在' });
+        return;
+    }
+
+    try {
+        if (dbReady) {
+            await dbQuery(
+                `INSERT INTO managed_clients (client_id, is_main) VALUES ($1, FALSE)
+                 ON CONFLICT (client_id) DO NOTHING`,
+                [clientId],
+            );
+        }
+        if (!CLIENT_IDS.includes(clientId)) CLIENT_IDS.push(clientId);
+
+        const entry = buildClient(clientId);
+        entry.client.initialize().catch((err) => {
+            log(`[${clientId}] initialize 失败: ${err?.message || err}`);
+        });
+
+        log(`[${clientId}] 已添加新账号，开始初始化。`);
+        res.json({ ok: true, clientId });
+    } catch (error) {
+        log(`添加账号失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '添加账号失败' });
+    }
+});
+
+// ── 动态删除账号（admin，不可删主机器人） ──────────────────────────────────
+app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+
+    const { clientId } = req.params;
+    if (clientId === MAIN_CLIENT_ID) {
+        res.status(400).json({ ok: false, message: '主机器人账号不可删除' });
+        return;
+    }
+
+    const entry = clientPool.get(clientId);
+    if (!entry) {
+        res.status(404).json({ ok: false, message: '账号不存在' });
+        return;
+    }
+
+    try {
+        await entry.client.destroy().catch(() => {});
+        clientPool.delete(clientId);
+        const idx = CLIENT_IDS.indexOf(clientId);
+        if (idx !== -1) CLIENT_IDS.splice(idx, 1);
+
+        if (dbReady) {
+            await dbQuery(`DELETE FROM managed_clients WHERE client_id = $1`, [clientId]);
+        }
+
+        const newClients = { ...state.clients };
+        delete newClients[clientId];
+        state.clients = newClients;
+        io.emit('clients', state.clients);
+
+        log(`[${clientId}] 账号已删除。`);
+        res.json({ ok: true });
+    } catch (error) {
+        log(`删除账号失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '删除账号失败' });
     }
 });
 
