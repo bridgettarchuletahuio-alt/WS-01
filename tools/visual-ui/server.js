@@ -673,6 +673,32 @@ const buildChecknumWorkbook = async (rows) => {
     return workbook;
 };
 
+const buildSimpleWorkbook = async (sheetName, headers, rows) => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet(sheetName || 'result');
+
+    sheet.columns = headers.map((header, idx) => ({
+        header,
+        key: `c${idx}`,
+        width: Math.max(14, Math.min(48, String(header).length + 10)),
+    }));
+
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true };
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    for (const item of rows) {
+        const values = Array.isArray(item) ? item : [item];
+        const rowObj = {};
+        headers.forEach((_, idx) => {
+            rowObj[`c${idx}`] = values[idx] ?? '';
+        });
+        sheet.addRow(rowObj);
+    }
+
+    return workbook;
+};
+
 const isMostlyPrintable = (text) => {
     if (!text) return false;
     let printable = 0;
@@ -2374,7 +2400,24 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             }
 
             const text = rows.join('\n');
-            const filename = `probe_${Date.now()}.txt`;
+            let outputBuffer = Buffer.from(text);
+            let filename = `probe_${Date.now()}.txt`;
+            let mimeType = 'text/plain';
+
+            if (stoppedEarly) {
+                const excelRows = rows
+                    .slice(1)
+                    .map((line) => line.split('\t'));
+                const wb = await buildSimpleWorkbook(
+                    'probe_partial',
+                    ['number', 'activity', 'ack', 'channel', 'note'],
+                    excelRows,
+                );
+                outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
+                filename = `probe_partial_${Date.now()}.xlsx`;
+                mimeType =
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+            }
 
             // 保存输入和输出文件
             const inputFileContent = fileContent
@@ -2387,7 +2430,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 rows.length - 1,
                 stoppedEarly,
                 Buffer.from(inputFileContent),
-                Buffer.from(text),
+                outputBuffer,
                 filename,
             );
 
@@ -2399,9 +2442,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 mode,
                 count: rows.length - 1,
                 stoppedEarly,
-                fileContent: Buffer.from(text).toString('base64'),
+                fileContent: outputBuffer.toString('base64'),
                 filename: filename,
-                mimeType: 'text/plain',
+                mimeType,
             });
         } else if (mode === 'checknumlist') {
             const numbers2 = parsedNumbers;
@@ -2431,7 +2474,23 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             }
 
             const text3 = resultLines.join('\n');
-            const filename = `checknumlist_${Date.now()}.txt`;
+            let outputBuffer = Buffer.from(text3);
+            let filename = `checknumlist_${Date.now()}.txt`;
+            let mimeType = 'text/plain';
+
+            if (stoppedEarly) {
+                const excelRows = resultLines
+                    .map((line) => line.split('\t'));
+                const wb = await buildSimpleWorkbook(
+                    'checknumlist_partial',
+                    ['number', 'status', 'wa_id'],
+                    excelRows,
+                );
+                outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
+                filename = `checknumlist_partial_${Date.now()}.xlsx`;
+                mimeType =
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+            }
 
             // 保存输入和输出文件
             const inputFileContent = fileContent
@@ -2444,7 +2503,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 resultLines.length,
                 stoppedEarly,
                 Buffer.from(inputFileContent),
-                Buffer.from(text3),
+                outputBuffer,
                 filename,
             );
 
@@ -2456,9 +2515,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 mode,
                 count: resultLines.length,
                 stoppedEarly,
-                fileContent: Buffer.from(text3).toString('base64'),
+                fileContent: outputBuffer.toString('base64'),
                 filename: filename,
-                mimeType: 'text/plain',
+                mimeType,
             });
         } else if (mode === 'activity') {
             const numbers2 = parsedNumbers;
@@ -2488,7 +2547,32 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             }
 
             const text4 = resultLines.join('\n');
-            const filename = `activity_${Date.now()}.txt`;
+            let outputBuffer = Buffer.from(text4);
+            let filename = `activity_${Date.now()}.txt`;
+            let mimeType = 'text/plain';
+
+            if (stoppedEarly) {
+                const excelRows = resultLines.map((line) => {
+                    const cols = line.split('\t');
+                    return [
+                        cols[0] || '',
+                        cols[1] || '',
+                        String(cols[2] || '').replace(/^frames=/, ''),
+                        String(cols[3] || '').replace(/^keyword=/, ''),
+                        String(cols[4] || '').replace(/^svc=/, ''),
+                        cols[5] || '',
+                    ];
+                });
+                const wb = await buildSimpleWorkbook(
+                    'activity_partial',
+                    ['number', 'state', 'frames', 'keyword', 'service', 'sample'],
+                    excelRows,
+                );
+                outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
+                filename = `activity_partial_${Date.now()}.xlsx`;
+                mimeType =
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+            }
 
             // 保存输入和输出文件
             const inputFileContent = fileContent
@@ -2501,7 +2585,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 resultLines.length,
                 stoppedEarly,
                 Buffer.from(inputFileContent),
-                Buffer.from(text4),
+                outputBuffer,
                 filename,
             );
 
@@ -2513,9 +2597,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 mode,
                 count: resultLines.length,
                 stoppedEarly,
-                fileContent: Buffer.from(text4).toString('base64'),
+                fileContent: outputBuffer.toString('base64'),
                 filename: filename,
-                mimeType: 'text/plain',
+                mimeType,
             });
         } else if (mode === 'wsdebug') {
             const number = parsedNumbers[0] || '';
@@ -2597,7 +2681,23 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             }
 
             const text6 = resultLines.join('\n');
-            const filename = `behavior_${Date.now()}.txt`;
+            let outputBuffer = Buffer.from(text6);
+            let filename = `behavior_${Date.now()}.txt`;
+            let mimeType = 'text/plain';
+
+            if (stoppedEarly) {
+                const excelRows = resultLines
+                    .map((line) => line.split('\t'));
+                const wb = await buildSimpleWorkbook(
+                    'behavior_partial',
+                    ['number', 'behavior', 'message'],
+                    excelRows,
+                );
+                outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
+                filename = `behavior_partial_${Date.now()}.xlsx`;
+                mimeType =
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+            }
 
             // 保存输入和输出文件
             const inputFileContent = fileContent
@@ -2610,7 +2710,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 resultLines.length,
                 stoppedEarly,
                 Buffer.from(inputFileContent),
-                Buffer.from(text6),
+                outputBuffer,
                 filename,
             );
 
@@ -2622,9 +2722,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 mode,
                 count: resultLines.length,
                 stoppedEarly,
-                fileContent: Buffer.from(text6).toString('base64'),
+                fileContent: outputBuffer.toString('base64'),
                 filename: filename,
-                mimeType: 'text/plain',
+                mimeType,
             });
         }
     } catch (error) {
