@@ -3083,12 +3083,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
 
 // 列出任务历史和文件
 app.get('/api/admin/task-history', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') {
-        res.status(403).json({ ok: false, message: '仅管理员可访问' });
-        return;
-    }
-
     try {
+        const isAdmin = req.user.role === 'admin';
         const userId = req.query.user_id ? Number(req.query.user_id) : null;
         const mode = req.query.mode ? String(req.query.mode).trim() : null;
         const username = req.query.username
@@ -3113,6 +3109,11 @@ app.get('/api/admin/task-history', authRequired, async (req, res) => {
         let query =
             'SELECT th.id, th.user_id, au.username, th.mode, th.input_count, th.output_count, th.stopped_early, th.input_file_path, th.output_file_path, th.created_at FROM task_history th LEFT JOIN app_users au ON au.id = th.user_id WHERE 1=1';
         const params = [];
+
+        if (!isAdmin) {
+            query += ` AND th.user_id = $${params.length + 1}`;
+            params.push(Number(req.user.sub));
+        }
 
         if (userId) {
             query += ` AND th.user_id = $${params.length + 1}`;
@@ -3176,12 +3177,8 @@ app.get(
     '/api/admin/task-files/:taskId/:fileType',
     authRequired,
     async (req, res) => {
-        if (req.user.role !== 'admin') {
-            res.status(403).json({ ok: false, message: '仅管理员可访问' });
-            return;
-        }
-
         try {
+            const isAdmin = req.user.role === 'admin';
             const taskId = Number(req.params.taskId);
             const fileType = String(req.params.fileType).toLowerCase(); // 'input' or 'output'
 
@@ -3191,7 +3188,7 @@ app.get(
             }
 
             const result = await dbQuery(
-                `SELECT ${fileType}_file_path as filepath, mode, created_at FROM task_history WHERE id = $1`,
+                `SELECT ${fileType}_file_path as filepath, mode, created_at, user_id FROM task_history WHERE id = $1`,
                 [taskId],
             );
 
@@ -3202,6 +3199,11 @@ app.get(
 
             const record = result.rows[0];
             const filepath = record.filepath;
+
+            if (!isAdmin && Number(record.user_id) !== Number(req.user.sub)) {
+                res.status(403).json({ ok: false, message: '无权限下载该任务文件' });
+                return;
+            }
 
             if (!filepath) {
                 res.status(404).json({ ok: false, message: '文件未保存' });
@@ -3255,12 +3257,8 @@ app.get(
 
 // 导出所有任务文件到 ZIP
 app.post('/api/admin/task-files/export', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') {
-        res.status(403).json({ ok: false, message: '仅管理员可访问' });
-        return;
-    }
-
     try {
+        const isAdmin = req.user.role === 'admin';
         const userId = req.body?.user_id ? Number(req.body.user_id) : null;
         const mode = req.body?.mode ? String(req.body.mode).trim() : null;
         const fromDate = req.body?.from_date
@@ -3271,6 +3269,11 @@ app.post('/api/admin/task-files/export', authRequired, async (req, res) => {
         let query =
             'SELECT id, user_id, (SELECT username FROM app_users WHERE id = task_history.user_id) as username, mode, input_file_path, output_file_path, created_at FROM task_history WHERE 1=1';
         const params = [];
+
+        if (!isAdmin) {
+            query += ` AND user_id = $${params.length + 1}`;
+            params.push(Number(req.user.sub));
+        }
 
         if (userId) {
             query += ` AND user_id = $${params.length + 1}`;

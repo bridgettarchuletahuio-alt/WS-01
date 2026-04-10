@@ -432,6 +432,43 @@
                 text-decoration: none;
             }
 
+            .task-history-card {
+                margin-top: 16px;
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 12px 25px rgba(15, 23, 42, 0.06);
+            }
+
+            .history-toolbar {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+                margin-bottom: 10px;
+            }
+
+            .history-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }
+
+            .history-table th,
+            .history-table td {
+                text-align: left;
+                border-bottom: 1px solid var(--border);
+                padding: 8px 6px;
+                vertical-align: middle;
+            }
+
+            .history-actions {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+
             @media (max-width: 900px) {
                 .grid {
                     grid-template-columns: 1fr;
@@ -586,6 +623,31 @@
                     <a class="task-download-btn" id="task-download-btn" style="display:none" download>⬇ 下载结果文件</a>
                 </div>
             </div>
+
+            <div class="task-history-card">
+                <h3 style="margin:0 0 4px">历史检测任务</h3>
+                <p class="muted" id="task-history-desc" style="margin:0 0 12px;font-size:13px">加载中...</p>
+                <div class="history-toolbar">
+                    <button id="task-history-refresh-btn" class="btn">刷新历史</button>
+                    <button id="task-history-export-btn" class="btn btn-primary">一键下载全部文件</button>
+                    <span id="task-history-status" class="muted" style="font-size:12px"></span>
+                </div>
+                <div style="overflow:auto">
+                    <table class="history-table">
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>用户</th>
+                                <th>模式</th>
+                                <th>处理/回传</th>
+                                <th>状态</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="task-history-body"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <script src="/socket.io/socket.io.js"></script>
@@ -615,6 +677,9 @@
             const newClientIdInput = document.getElementById('new-client-id');
             const confirmAddClientBtn = document.getElementById('confirm-add-client-btn');
             const cancelAddClientBtn = document.getElementById('cancel-add-client-btn');
+            const taskHistoryBodyEl = document.getElementById('task-history-body');
+            const taskHistoryStatusEl = document.getElementById('task-history-status');
+            const taskHistoryDescEl = document.getElementById('task-history-desc');
 
             const socket = io({ auth: { token: localStorage.getItem(tokenKey) || '' } });
             let clientsState = {};
@@ -635,6 +700,137 @@
 
             const setRouteError = (msg) => {
                 routeErrorEl.textContent = msg || '';
+            };
+
+            const triggerDownload = (blob, filename) => {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename || 'download.bin';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            };
+
+            const downloadTaskFile = async (taskId, fileType = 'output') => {
+                const resp = await authFetch(`/api/admin/task-files/${taskId}/${fileType}`, {
+                    method: 'GET',
+                    headers: {
+                        Authorization: `Bearer ${localStorage.getItem(tokenKey) || ''}`,
+                    },
+                });
+                if (!resp.ok) {
+                    const data = await resp.json().catch(() => ({}));
+                    throw new Error(data.message || '下载失败');
+                }
+                const disposition = resp.headers.get('content-disposition') || '';
+                const m = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
+                const filename = decodeURIComponent(m?.[1] || m?.[2] || `${fileType}_${taskId}`);
+                const blob = await resp.blob();
+                triggerDownload(blob, filename);
+            };
+
+            const exportAllTaskFiles = async () => {
+                const btn = document.getElementById('task-history-export-btn');
+                btn.disabled = true;
+                btn.textContent = '打包中...';
+                taskHistoryStatusEl.textContent = '正在打包所有历史任务文件，请稍候...';
+                try {
+                    const resp = await authFetch('/api/admin/task-files/export', {
+                        method: 'POST',
+                        body: JSON.stringify({}),
+                    });
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        throw new Error(data.message || '导出失败');
+                    }
+                    const disposition = resp.headers.get('content-disposition') || '';
+                    const m = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
+                    const filename = decodeURIComponent(m?.[1] || m?.[2] || `task-files-export-${Date.now()}.zip`);
+                    const blob = await resp.blob();
+                    triggerDownload(blob, filename);
+                    taskHistoryStatusEl.textContent = '导出完成，已开始下载。';
+                } catch (err) {
+                    taskHistoryStatusEl.textContent = err?.message || '导出失败';
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = '一键下载全部文件';
+                }
+            };
+
+            const renderTaskHistory = (items = []) => {
+                taskHistoryBodyEl.innerHTML = '';
+                if (!items.length) {
+                    const tr = document.createElement('tr');
+                    const td = document.createElement('td');
+                    td.colSpan = 6;
+                    td.className = 'muted';
+                    td.textContent = '暂无历史任务';
+                    tr.appendChild(td);
+                    taskHistoryBodyEl.appendChild(tr);
+                    return;
+                }
+
+                items.forEach((item) => {
+                    const tr = document.createElement('tr');
+                    const time = new Date(item.created_at).toLocaleString('zh-CN');
+                    const status = item.stopped_early ? '中止' : '完成';
+                    const outputExists = Boolean(item.output_file_path);
+
+                    tr.innerHTML = `
+                        <td>${time}</td>
+                        <td>${item.username || '-'}</td>
+                        <td>${item.mode || '-'}</td>
+                        <td>${item.input_count || 0} / ${item.output_count || 0}</td>
+                        <td>${status}</td>
+                        <td></td>
+                    `;
+
+                    const actionTd = tr.lastElementChild;
+                    const actionWrap = document.createElement('div');
+                    actionWrap.className = 'history-actions';
+
+                    const outBtn = document.createElement('button');
+                    outBtn.className = 'btn btn-primary';
+                    outBtn.style.fontSize = '12px';
+                    outBtn.textContent = '下载结果';
+                    outBtn.disabled = !outputExists;
+                    outBtn.addEventListener('click', async () => {
+                        outBtn.disabled = true;
+                        const oldText = outBtn.textContent;
+                        outBtn.textContent = '下载中...';
+                        try {
+                            await downloadTaskFile(item.id, 'output');
+                        } catch (e) {
+                            alert(e?.message || '下载失败');
+                        } finally {
+                            outBtn.disabled = !outputExists;
+                            outBtn.textContent = oldText;
+                        }
+                    });
+
+                    actionWrap.appendChild(outBtn);
+                    actionTd.appendChild(actionWrap);
+                    taskHistoryBodyEl.appendChild(tr);
+                });
+            };
+
+            const loadTaskHistory = async () => {
+                taskHistoryStatusEl.textContent = '加载历史任务中...';
+                const resp = await authFetch('/api/admin/task-history?limit=100', {
+                    method: 'GET',
+                });
+                const data = await resp.json().catch(() => ({ ok: false, items: [] }));
+                if (!resp.ok || !data.ok) {
+                    taskHistoryStatusEl.textContent = data.message || '加载历史任务失败';
+                    return;
+                }
+                taskHistoryDescEl.textContent = currentUser?.role === 'admin'
+                    ? `管理员视图：显示全部用户历史任务（共 ${data.total || 0} 条）`
+                    : `个人视图：仅显示你的历史任务（共 ${data.total || 0} 条）`;
+                taskHistoryStatusEl.textContent = `已加载 ${data.items?.length || 0} 条`;
+                renderTaskHistory(data.items || []);
             };
 
             const selectedRouteClientIds = () => {
@@ -682,6 +878,7 @@
                         document.getElementById('user-mgmt-section').classList.add('visible');
                         await loadUsers();
                     }
+                    await loadTaskHistory();
                     return true;
                 } catch {
                     localStorage.removeItem(tokenKey);
@@ -1377,6 +1574,7 @@
                     }
                     statusText.textContent = '执行完成';
                     showTaskResult(data);
+                    await loadTaskHistory();
                 } catch (err) {
                     errEl.textContent = '网络异常，请重试';
                     statusText.textContent = '';
@@ -1391,6 +1589,14 @@
                 if (!ok) return;
                 await loadRoutes();
             })();
+
+            document.getElementById('task-history-refresh-btn').addEventListener('click', async () => {
+                await loadTaskHistory();
+            });
+
+            document.getElementById('task-history-export-btn').addEventListener('click', async () => {
+                await exportAllTaskFiles();
+            });
         </script>
     </body>
 </html>
