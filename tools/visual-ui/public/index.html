@@ -1561,10 +1561,12 @@
 
                 const failureByReason = (data.diagnostics && data.diagnostics.avatarFetchFailureByReason) || {};
                 const failureByBot = (data.diagnostics && data.diagnostics.avatarFetchFailureByBot) || {};
+                const failureTopErrors = (data.diagnostics && data.diagnostics.avatarFetchFailureTopErrors) || [];
                 const reasonLabelMap = {
                     session: '会话/在线',
                     network: '网络超时',
                     rate_limit: '频率限制',
+                    runtime: '页面上下文异常',
                     jid: 'JID异常',
                     no_avatar: '无头像/隐私',
                     unknown: '未知',
@@ -1589,6 +1591,17 @@
                     metaEl.textContent = metaEl.textContent
                         ? `${metaEl.textContent} ｜ 失败机器人：${botFailureItems.join('，')}`
                         : `失败机器人：${botFailureItems.join('，')}`;
+                }
+
+                const topErrorItems = (Array.isArray(failureTopErrors) ? failureTopErrors : [])
+                    .filter((v) => String(v || '').trim())
+                    .slice(0, 2)
+                    .map((v) => String(v));
+                if (topErrorItems.length) {
+                    metaEl.style.display = 'block';
+                    metaEl.textContent = metaEl.textContent
+                        ? `${metaEl.textContent} ｜ 典型报错：${topErrorItems.join('；')}`
+                        : `典型报错：${topErrorItems.join('；')}`;
                 }
 
                 // All results are files — build blob URL and show download button

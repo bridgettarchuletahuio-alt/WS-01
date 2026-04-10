@@ -1249,6 +1249,13 @@ const classifyAvatarFetchError = (errorText = '') => {
     if (/(429|too many requests|rate limit|throttl)/.test(t)) {
         return 'rate_limit';
     }
+    if (
+        /(evaluation failed|protocol error|frame was detached|detached frame|cannot find context|cannot read properties of undefined|window\.store|store\.|widfactory|execution context)/.test(
+            t,
+        )
+    ) {
+        return 'runtime';
+    }
     if (/(invalid wid|invalid jid|wid error|bad jid|jid)/.test(t)) {
         return 'jid';
     }
@@ -1261,6 +1268,7 @@ const classifyAvatarFetchError = (errorText = '') => {
 const summarizeAvatarFetchFailures = (rows = []) => {
     const byReason = {};
     const byBot = {};
+    const byErrorText = {};
 
     for (const row of rows) {
         const note = String(row?.note || '');
@@ -1269,9 +1277,16 @@ const summarizeAvatarFetchFailures = (rows = []) => {
         const errorText = (note.match(/^avatar_fetch_failed:([^|]+)/) || [])[1] || '';
         const bot = (note.match(/\|bot=([^|]+)/) || [])[1] || '-';
         const reason = classifyAvatarFetchError(errorText);
+        const cleanedError = String(errorText || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 180);
 
         byReason[reason] = Number(byReason[reason] || 0) + 1;
         byBot[bot] = Number(byBot[bot] || 0) + 1;
+        if (cleanedError) {
+            byErrorText[cleanedError] = Number(byErrorText[cleanedError] || 0) + 1;
+        }
     }
 
     const topReasonEntry = Object.entries(byReason).sort((a, b) => b[1] - a[1])[0] || [
@@ -1282,12 +1297,22 @@ const summarizeAvatarFetchFailures = (rows = []) => {
         '-',
         0,
     ];
+    const topErrorEntry = Object.entries(byErrorText).sort((a, b) => b[1] - a[1])[0] || [
+        '',
+        0,
+    ];
+    const topErrorSamples = Object.entries(byErrorText)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([text, count]) => `${text} (${count}条)`);
 
     const reasonAdvice = {
         session:
             '建议优先检查机器人在线状态与会话是否失效，必要时重新扫码登录后重试。',
         network: '建议检查该机器人网络/代理连通性，确保请求稳定后再重试。',
         rate_limit: '建议降低并发频率，间隔一段时间后重试。',
+        runtime:
+            '建议重启该机器人实例（或 Puppeteer 会话）后重试，并确保页面上下文未丢失。',
         jid: '建议检查号码规范化与 JID 解析结果。',
         no_avatar: '多数属于目标无头像或隐私不可见，不是机器人故障。',
         unknown: '建议查看服务端日志中的原始错误文本进一步定位。',
@@ -1300,6 +1325,9 @@ const summarizeAvatarFetchFailures = (rows = []) => {
         topReasonCount: Number(topReasonEntry[1] || 0),
         topBotId: topBotEntry[0],
         topBotCount: Number(topBotEntry[1] || 0),
+        topErrorText: topErrorEntry[0],
+        topErrorCount: Number(topErrorEntry[1] || 0),
+        topErrorSamples,
         advice: reasonAdvice[topReasonEntry[0]] || reasonAdvice.unknown,
     };
 };
@@ -2938,14 +2966,19 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     session: '会话/在线状态异常',
                     network: '网络或请求超时',
                     rate_limit: '频率限制',
+                    runtime: '页面上下文/运行时异常',
                     jid: 'JID 解析异常',
                     no_avatar: '目标无头像或隐私不可见',
                     unknown: '未知错误',
                 };
+                const topErrorHint = avatarFailureSummary.topErrorText
+                    ? ` 典型报错：${avatarFailureSummary.topErrorText}（${avatarFailureSummary.topErrorCount} 条）。`
+                    : '';
                 diagnosticMessage =
                     `头像抓取接口失败 ${avatarFetchFailedCount} 条，` +
                     `主要集中在机器人 ${avatarFailureSummary.topBotId}（${avatarFailureSummary.topBotCount} 条），` +
                     `主因：${reasonLabels[avatarFailureSummary.topReason] || '未知错误'}（${avatarFailureSummary.topReasonCount} 条）。` +
+                    topErrorHint +
                     avatarFailureSummary.advice;
             }
 
@@ -2986,6 +3019,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     avatarFetchFailureByReason:
                         avatarFailureSummary.byReason,
                     avatarFetchFailureByBot: avatarFailureSummary.byBot,
+                    avatarFetchFailureTopErrors:
+                        avatarFailureSummary.topErrorSamples,
                 },
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
