@@ -1991,13 +1991,15 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 }
             }
 
-            const workbook = await buildChecknumWorkbook(excelRows);
+            const avatarRows = excelRows.filter((item) => Boolean(item.avatarUrl));
+            const workbook = await buildChecknumWorkbook(avatarRows);
             const buffer = await workbook.xlsx.writeBuffer();
-            log(`[task/checknum] 用户 ${req.user.username} 完成，共 ${excelRows.length} 条${stoppedEarly ? '（提前中止）' : ''}`);
+            log(`[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有头像 ${avatarRows.length} 条${stoppedEarly ? '（提前中止）' : ''}`);
             res.json({
                 ok: true,
                 mode,
-                count: excelRows.length,
+                count: avatarRows.length,
+                processedCount: excelRows.length,
                 stoppedEarly,
                 fileContent: Buffer.from(buffer).toString('base64'),
                 filename: `checknum_${Date.now()}.xlsx`,

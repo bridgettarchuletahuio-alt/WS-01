@@ -1219,7 +1219,11 @@
                 box.classList.add('visible');
 
                 const stopped = data.stoppedEarly ? ' （筛选账号中途不可用，已中止）' : '';
-                summary.textContent = `完成：共处理 ${data.count} 条${stopped}`;
+                if (typeof data.processedCount === 'number') {
+                    summary.textContent = `完成：处理 ${data.processedCount} 条，回传 ${data.count} 条${stopped}`;
+                } else {
+                    summary.textContent = `完成：共处理 ${data.count} 条${stopped}`;
+                }
 
                 // All results are files — build blob URL and show download button
                 const contentBase64 = data.fileContent;
