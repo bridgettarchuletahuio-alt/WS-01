@@ -1033,25 +1033,59 @@ const resolveProfilePicUrl = async (
 ) => {
     if (!jid) return '';
 
-    if (primaryClient && typeof primaryClient.getProfilePicUrl === 'function') {
-        try {
-            const url = await primaryClient.getProfilePicUrl(jid);
-            if (url) return url;
-        } catch {
-            // fallback to other ready clients below
-        }
-    }
-
-    try {
-        const url = await runWithExecutionClient(
-            preferredClientId,
-            (execClient) => execClient.getProfilePicUrl(jid),
-            { allowedClientIds },
-        );
-        return url || '';
-    } catch {
+    // 按用户要求：不做多账号兜底，仅在当前分配机器人内重试
+    const clientRef = primaryClient;
+    if (!clientRef || typeof clientRef.getProfilePicUrl !== 'function') {
         return '';
     }
+
+    for (let i = 0; i < 3; i++) {
+        try {
+            const url = await clientRef.getProfilePicUrl(jid);
+            if (url) return url;
+        } catch {
+            // same-client retry only
+        }
+        if (i < 2) await sleep(120 + i * 180);
+    }
+
+    return '';
+};
+
+const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
+    if (!jid) {
+        return { url: '', note: 'missing_jid', attempts: 0 };
+    }
+
+    const clientRef = primaryClient;
+    if (!clientRef || typeof clientRef.getProfilePicUrl !== 'function') {
+        return { url: '', note: 'avatar_client_unavailable', attempts: 0 };
+    }
+
+    let lastError = '';
+    for (let i = 0; i < 3; i++) {
+        try {
+            const url = await clientRef.getProfilePicUrl(jid);
+            if (url) {
+                return { url, note: '', attempts: i + 1 };
+            }
+        } catch (e) {
+            lastError = String(e?.message || e || '')
+                .replace(/[\r\n\t]+/g, ' ')
+                .slice(0, 80);
+        }
+        if (i < 2) await sleep(120 + i * 180);
+    }
+
+    if (lastError) {
+        return {
+            url: '',
+            note: `avatar_fetch_failed:${lastError}`,
+            attempts: 3,
+        };
+    }
+
+    return { url: '', note: 'no_avatar_or_privacy', attempts: 3 };
 };
 
 const resolveNumberIdWithFallback = async (
@@ -1059,45 +1093,32 @@ const resolveNumberIdWithFallback = async (
     preferredClientId,
     allowedClientIds = null,
     primaryClient = null,
+    primaryClientId = '',
 ) => {
     if (!number) {
         return { numberId: null, clientRef: null, clientId: '' };
     }
 
-    if (primaryClient) {
-        try {
-            const value = await resolveNumberId(primaryClient, number);
-            if (value) {
-                return {
-                    numberId: value,
-                    clientRef: primaryClient,
-                    clientId: preferredClientId || '',
-                };
-            }
-        } catch {
-            // fallback to other ready clients below
-        }
+    // 按用户要求：不做多账号兜底，仅在当前分配机器人内重试
+    const clientRef = primaryClient;
+    if (!clientRef) {
+        return { numberId: null, clientRef: null, clientId: '' };
     }
 
     try {
-        const resolved = await runWithExecutionClient(
-            preferredClientId,
-            async (execClient, execClientId) => {
-                const value = await resolveNumberId(execClient, number);
-                return {
-                    numberId: value || null,
-                    clientRef: value ? execClient : null,
-                    clientId: value ? execClientId : '',
-                };
-            },
-            { allowedClientIds },
-        );
-        return (
-            resolved || { numberId: null, clientRef: null, clientId: '' }
-        );
+        const value = await resolveNumberId(clientRef, number);
+        if (value) {
+            return {
+                numberId: value,
+                clientRef,
+                clientId: primaryClientId || preferredClientId || '',
+            };
+        }
     } catch {
-        return { numberId: null, clientRef: null, clientId: '' };
+        // ignore and return null
     }
+
+    return { numberId: null, clientRef: null, clientId: '' };
 };
 
 const runProbeForNumber = async (clientRef, number, probeText) => {
@@ -2616,12 +2637,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 preferredClientId,
                 {
                     allowedClientIds,
-                    worker: async (execClient, number) => {
+                    worker: async (execClient, number, workerClientId) => {
                         const resolved = await resolveNumberIdWithFallback(
                             number,
                             preferredClientId,
                             allowedClientIds,
                             execClient,
+                            workerClientId,
                         );
                         const numberId = resolved.numberId;
                         const status = numberId ? 'valid' : 'invalid';
@@ -2630,15 +2652,16 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         let avatarUrl = '';
                         let note = '';
                         if (numberId?._serialized) {
-                            avatarUrl = await resolveProfilePicUrl(
+                            const avatarDetail = await resolveProfilePicWithDetail(
                                 numberId._serialized,
-                                preferredClientId,
-                                allowedClientIds,
                                 resolved.clientRef || execClient,
                             );
-                            if (!avatarUrl) note = 'no_avatar';
+                            avatarUrl = avatarDetail.url;
+                            if (!avatarUrl) {
+                                note = `${avatarDetail.note || 'no_avatar'}|bot=${resolved.clientId || workerClientId || '-'}`;
+                            }
                         } else {
-                            note = 'not_registered';
+                            note = `not_registered|bot=${resolved.clientId || workerClientId || '-'}`;
                         }
 
                         return { number, status, waId, avatarUrl, note };
@@ -2673,6 +2696,10 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const buffer = await workbook.xlsx.writeBuffer();
             const filename = `checknum_${Date.now()}.xlsx`;
 
+            const notRegisteredCount = excelRows.filter((r) => String(r.note || '').includes('not_registered')).length;
+            const noAvatarCount = excelRows.filter((r) => String(r.note || '').includes('no_avatar')).length;
+            const avatarFetchFailedCount = excelRows.filter((r) => String(r.note || '').includes('avatar_fetch_failed')).length;
+
             await addDailyProcessedCount(userId, processedCount);
 
             // 保存输入和输出文件
@@ -2691,7 +2718,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             );
 
             log(
-                `[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有头像 ${avatarRows.length} 条${stoppedEarly ? '（提前中止）' : ''}`,
+                `[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有头像 ${avatarRows.length} 条，未注册 ${notRegisteredCount} 条，无头像/隐私 ${noAvatarCount} 条，头像抓取失败 ${avatarFetchFailedCount} 条${stoppedEarly ? '（提前中止）' : ''}`,
             );
             res.json({
                 ok: true,
