@@ -1027,6 +1027,35 @@ const resolveNumberId = async (clientRef, number, retries = 2) => {
     return last;
 };
 
+const resolveProfilePicUrl = async (
+    jid,
+    preferredClientId,
+    allowedClientIds = null,
+    primaryClient = null,
+) => {
+    if (!jid) return '';
+
+    if (primaryClient && typeof primaryClient.getProfilePicUrl === 'function') {
+        try {
+            const url = await primaryClient.getProfilePicUrl(jid);
+            if (url) return url;
+        } catch {
+            // fallback to other ready clients below
+        }
+    }
+
+    try {
+        const url = await runWithExecutionClient(
+            preferredClientId,
+            (execClient) => execClient.getProfilePicUrl(jid),
+            { allowedClientIds },
+        );
+        return url || '';
+    } catch {
+        return '';
+    }
+};
+
 const runProbeForNumber = async (clientRef, number, probeText) => {
     const numberId = await resolveNumberId(clientRef, number);
     if (!numberId) {
@@ -2538,16 +2567,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         let avatarUrl = '';
                         let note = '';
                         if (numberId?._serialized) {
-                            try {
-                                const maybeAvatar =
-                                    await execClient.getProfilePicUrl(
-                                        numberId._serialized,
-                                    );
-                                avatarUrl = maybeAvatar || '';
-                                if (!avatarUrl) note = 'no_avatar';
-                            } catch {
-                                note = 'avatar_fetch_failed';
-                            }
+                            avatarUrl = await resolveProfilePicUrl(
+                                numberId._serialized,
+                                preferredClientId,
+                                allowedClientIds,
+                                execClient,
+                            );
+                            if (!avatarUrl) note = 'no_avatar';
                         } else {
                             note = 'not_registered';
                         }
