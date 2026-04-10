@@ -1068,8 +1068,6 @@ const resolveProfilePicWithDetail = async (
 
     const raw = String(jid || '');
     const rawUser = raw.split('@')[0] || '';
-    const rawServer = raw.includes('@') ? raw.split('@')[1] : '';
-    const normalizedRawUser = normalizePhoneInput(rawUser);
     const normalizedFallbackNumber = normalizePhoneInput(fallbackNumber);
     const pickHttpUrl = (value) => {
         const v = String(value || '').trim();
@@ -1136,6 +1134,13 @@ const resolveProfilePicWithDetail = async (
         return /^\d{6,24}@(c\.us|lid)$/i.test(v);
     };
     const isLikelyPhoneDigits = (digits) => /^\d{8,13}$/.test(String(digits || ''));
+    const isLikelyPhoneCUsJid = (value) => {
+        const v = String(value || '').trim();
+        const m = v.match(/^(\d+)@c\.us$/i);
+        if (!m) return false;
+        return isLikelyPhoneDigits(m[1]);
+    };
+    const isLikelyLidJid = (value) => /^\d{6,24}@lid$/i.test(String(value || '').trim());
     const pushCandidate = (id) => {
         const v = String(id || '').trim();
         if (!v) return;
@@ -1143,24 +1148,27 @@ const resolveProfilePicWithDetail = async (
         if (!jidCandidates.includes(v)) jidCandidates.push(v);
     };
 
-    // Only use canonical numeric WA IDs for avatar lookup to avoid
-    // errors like "No LID for user s" from malformed/non-numeric JIDs.
-    // Keep raw JID first when it is a valid canonical WA identity.
-    if (isCanonicalAvatarJid(raw)) {
+    // Prefer raw LID identities; these are usually the most accurate for avatar fetch.
+    if (isLikelyLidJid(raw)) {
         pushCandidate(raw);
     }
 
-    // Only build c.us from likely phone numbers; do not coerce long IDs.
+    // Only build c.us from the actual input phone number.
     if (isLikelyPhoneDigits(normalizedFallbackNumber)) {
         pushCandidate(`${normalizedFallbackNumber}@c.us`);
     }
-    if (isLikelyPhoneDigits(normalizedRawUser)) {
-        pushCandidate(`${normalizedRawUser}@c.us`);
+
+    // Only keep raw c.us when it looks like a phone or exactly equals the input number.
+    if (
+        /^\d+@c\.us$/i.test(raw) &&
+        (isLikelyPhoneCUsJid(raw) || rawUser === normalizedFallbackNumber)
+    ) {
+        pushCandidate(raw);
     }
 
-    // If raw looks like a LID identity, prefer lid over synthetic c.us.
-    if (rawServer.toLowerCase() === 'lid' && /^\d{6,24}$/.test(rawUser)) {
-        pushCandidate(`${rawUser}@lid`);
+    // Last resort: if fallback number is unavailable, retain raw canonical JID.
+    if (!jidCandidates.length && isCanonicalAvatarJid(raw)) {
+        pushCandidate(raw);
     }
 
     if (!jidCandidates.length) {
