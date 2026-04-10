@@ -2095,10 +2095,22 @@ app.get('/api/users', authRequired, async (req, res) => {
         return;
     }
     try {
+        const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 200);
+        const offset = Math.max(Number(req.query.offset) || 0, 0);
         const result = await dbQuery(
-            `SELECT id, username, role, approved, created_at FROM app_users ORDER BY id ASC`,
+            `SELECT id, username, role, approved, created_at FROM app_users ORDER BY id ASC LIMIT $1 OFFSET $2`,
+            [limit, offset],
         );
-        res.json({ ok: true, users: result.rows });
+        const countRes = await dbQuery(
+            `SELECT COUNT(*)::int AS total FROM app_users`,
+        );
+        res.json({
+            ok: true,
+            users: result.rows,
+            total: Number(countRes.rows[0]?.total || 0),
+            limit,
+            offset,
+        });
     } catch (error) {
         log(`users 查询失败: ${error?.message || error}`);
         res.status(500).json({ ok: false, message: '查询失败' });

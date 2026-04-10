@@ -583,6 +583,11 @@
                         </thead>
                         <tbody id="users-body"></tbody>
                     </table>
+                    <div style="display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:10px">
+                        <button id="users-prev-btn" class="btn">上一页</button>
+                        <span id="users-page-info" class="muted" style="font-size:12px">第 1 页</span>
+                        <button id="users-next-btn" class="btn">下一页</button>
+                    </div>
                 </div>
             </div>
 
@@ -654,6 +659,11 @@
                         <tbody id="task-history-body"></tbody>
                     </table>
                 </div>
+                <div style="display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:10px">
+                    <button id="task-history-prev-btn" class="btn">上一页</button>
+                    <span id="task-history-page-info" class="muted" style="font-size:12px">第 1 页</span>
+                    <button id="task-history-next-btn" class="btn">下一页</button>
+                </div>
             </div>
         </div>
 
@@ -687,6 +697,15 @@
             const taskHistoryBodyEl = document.getElementById('task-history-body');
             const taskHistoryStatusEl = document.getElementById('task-history-status');
             const taskHistoryDescEl = document.getElementById('task-history-desc');
+            const usersPrevBtn = document.getElementById('users-prev-btn');
+            const usersNextBtn = document.getElementById('users-next-btn');
+            const usersPageInfoEl = document.getElementById('users-page-info');
+            const taskHistoryPrevBtn = document.getElementById('task-history-prev-btn');
+            const taskHistoryNextBtn = document.getElementById('task-history-next-btn');
+            const taskHistoryPageInfoEl = document.getElementById('task-history-page-info');
+
+            const usersPager = { limit: 20, offset: 0, total: 0 };
+            const historyPager = { limit: 20, offset: 0, total: 0 };
 
             const socket = io({ auth: { token: localStorage.getItem(tokenKey) || '' } });
             let clientsState = {};
@@ -825,19 +844,29 @@
 
             const loadTaskHistory = async () => {
                 taskHistoryStatusEl.textContent = '加载历史任务中...';
-                const resp = await authFetch('/api/admin/task-history?limit=100', {
+                const resp = await authFetch(
+                    `/api/admin/task-history?limit=${historyPager.limit}&offset=${historyPager.offset}`,
+                    {
                     method: 'GET',
-                });
+                    },
+                );
                 const data = await resp.json().catch(() => ({ ok: false, items: [] }));
                 if (!resp.ok || !data.ok) {
                     taskHistoryStatusEl.textContent = data.message || '加载历史任务失败';
                     return;
                 }
+                historyPager.total = Number(data.total || 0);
                 taskHistoryDescEl.textContent = currentUser?.role === 'admin'
                     ? `管理员视图：显示全部用户历史任务（共 ${data.total || 0} 条）`
                     : `个人视图：仅显示你的历史任务（共 ${data.total || 0} 条）`;
                 taskHistoryStatusEl.textContent = `已加载 ${data.items?.length || 0} 条`;
                 renderTaskHistory(data.items || []);
+
+                const currentPage = Math.floor(historyPager.offset / historyPager.limit) + 1;
+                const totalPages = Math.max(1, Math.ceil(historyPager.total / historyPager.limit));
+                taskHistoryPageInfoEl.textContent = `第 ${currentPage} / ${totalPages} 页`;
+                taskHistoryPrevBtn.disabled = historyPager.offset <= 0;
+                taskHistoryNextBtn.disabled = historyPager.offset + historyPager.limit >= historyPager.total;
             };
 
             const selectedRouteClientIds = () => {
@@ -1038,9 +1067,20 @@
             };
 
             const loadUsers = async () => {
-                const resp = await authFetch('/api/users', { method: 'GET' });
+                const resp = await authFetch(
+                    `/api/users?limit=${usersPager.limit}&offset=${usersPager.offset}`,
+                    { method: 'GET' },
+                );
                 const data = await resp.json().catch(() => ({ ok: false, users: [] }));
-                if (data.ok) renderUsers(data.users || []);
+                if (data.ok) {
+                    usersPager.total = Number(data.total || 0);
+                    renderUsers(data.users || []);
+                    const currentPage = Math.floor(usersPager.offset / usersPager.limit) + 1;
+                    const totalPages = Math.max(1, Math.ceil(usersPager.total / usersPager.limit));
+                    usersPageInfoEl.textContent = `第 ${currentPage} / ${totalPages} 页`;
+                    usersPrevBtn.disabled = usersPager.offset <= 0;
+                    usersNextBtn.disabled = usersPager.offset + usersPager.limit >= usersPager.total;
+                }
             };
 
             // 手动创建用户
@@ -1618,11 +1658,32 @@
             })();
 
             document.getElementById('task-history-refresh-btn').addEventListener('click', async () => {
+                historyPager.offset = 0;
                 await loadTaskHistory();
             });
 
             document.getElementById('task-history-export-btn').addEventListener('click', async () => {
                 await exportAllTaskFiles();
+            });
+
+            usersPrevBtn.addEventListener('click', async () => {
+                usersPager.offset = Math.max(0, usersPager.offset - usersPager.limit);
+                await loadUsers();
+            });
+
+            usersNextBtn.addEventListener('click', async () => {
+                usersPager.offset += usersPager.limit;
+                await loadUsers();
+            });
+
+            taskHistoryPrevBtn.addEventListener('click', async () => {
+                historyPager.offset = Math.max(0, historyPager.offset - historyPager.limit);
+                await loadTaskHistory();
+            });
+
+            taskHistoryNextBtn.addEventListener('click', async () => {
+                historyPager.offset += historyPager.limit;
+                await loadTaskHistory();
             });
         </script>
     </body>
