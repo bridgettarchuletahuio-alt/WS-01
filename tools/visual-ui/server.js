@@ -1521,6 +1521,45 @@ app.get('/api/users', authRequired, async (req, res) => {
     }
 });
 
+// Admin 手动创建用户
+app.post('/api/users', authRequired, async (req, res) => {
+    if (!dbReady) { dbUnavailable(res); return; }
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+    const username = String(req.body?.username || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const role = ['admin', 'operator'].includes(req.body?.role) ? req.body.role : 'operator';
+
+    if (!/^[a-z0-9_]{3,32}$/.test(username)) {
+        res.status(400).json({ ok: false, message: '用户名需为3-32位字母数字下划线' });
+        return;
+    }
+    if (password.length < 6) {
+        res.status(400).json({ ok: false, message: '密码至少6位' });
+        return;
+    }
+    try {
+        const passwordHash = await bcrypt.hash(password, 10);
+        const result = await dbQuery(
+            `INSERT INTO app_users (username, password_hash, role, approved)
+             VALUES ($1, $2, $3, TRUE)
+             RETURNING id, username, role, approved`,
+            [username, passwordHash, role],
+        );
+        log(`admin ${req.user.username} 创建用户: ${username} (${role})`);
+        res.json({ ok: true, user: result.rows[0] });
+    } catch (error) {
+        if (String(error?.message || '').includes('duplicate key')) {
+            res.status(409).json({ ok: false, message: '用户名已存在' });
+            return;
+        }
+        log(`admin 创建用户失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '创建失败' });
+    }
+});
+
 app.patch('/api/users/:id', authRequired, async (req, res) => {
     if (!dbReady) { dbUnavailable(res); return; }
     if (req.user.role !== 'admin') {
