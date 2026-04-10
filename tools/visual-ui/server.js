@@ -1132,7 +1132,6 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
     pushCandidate(raw);
     if (userPart) {
         pushCandidate(`${userPart}@c.us`);
-        pushCandidate(`${userPart}@s.whatsapp.net`);
     }
 
     let lastError = '';
@@ -1256,7 +1255,7 @@ const classifyAvatarFetchError = (errorText = '') => {
     ) {
         return 'runtime';
     }
-    if (/(invalid wid|invalid jid|wid error|bad jid|jid)/.test(t)) {
+    if (/(invalid wid|invalid jid|wid error|bad jid|jid|no lid for user)/.test(t)) {
         return 'jid';
     }
     if (/(404|not found|no profile|profile pic)/.test(t)) {
