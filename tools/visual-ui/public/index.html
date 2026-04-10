@@ -258,6 +258,87 @@
                 min-height: 20px;
             }
 
+            /* 用户管理 */
+            #user-mgmt-section {
+                display: none;
+            }
+            #user-mgmt-section.visible {
+                display: block;
+            }
+            .user-mgmt-card {
+                margin-top: 16px;
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 12px 25px rgba(15, 23, 42, 0.06);
+            }
+            .users-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+                margin-top: 8px;
+            }
+            .users-table th,
+            .users-table td {
+                text-align: left;
+                border-bottom: 1px solid var(--border);
+                padding: 8px 6px;
+                vertical-align: middle;
+            }
+            .users-table select {
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 3px 6px;
+                background: #fff;
+                font-size: 12px;
+            }
+            .toggle-approved {
+                position: relative;
+                display: inline-block;
+                width: 36px;
+                height: 20px;
+                flex-shrink: 0;
+            }
+            .toggle-approved input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+            }
+            .toggle-approved .slider {
+                position: absolute;
+                inset: 0;
+                border-radius: 20px;
+                background: #d1d5db;
+                cursor: pointer;
+                transition: 0.2s;
+            }
+            .toggle-approved input:checked + .slider {
+                background: #0f766e;
+            }
+            .toggle-approved .slider::before {
+                content: '';
+                position: absolute;
+                width: 14px;
+                height: 14px;
+                left: 3px;
+                top: 3px;
+                border-radius: 50%;
+                background: white;
+                transition: 0.2s;
+            }
+            .toggle-approved input:checked + .slider::before {
+                transform: translateX(16px);
+            }
+            .tag-self {
+                font-size: 10px;
+                background: #fef9c3;
+                color: #854d0e;
+                border-radius: 4px;
+                padding: 1px 4px;
+                margin-left: 4px;
+            }
+
             @media (max-width: 900px) {
                 .grid {
                     grid-template-columns: 1fr;
@@ -317,6 +398,25 @@
                     <ul class="logs" id="logs"></ul>
                 </section>
             </div>
+
+            <!-- 用户管理（仅 admin） -->
+            <div id="user-mgmt-section">
+                <div class="user-mgmt-card">
+                    <h3 style="margin:0 0 4px">用户管理</h3>
+                    <p class="muted" style="margin:0 0 8px;font-size:13px">管理注册用户的角色与访问权限。未审批用户登录时会被拒绝。</p>
+                    <table class="users-table">
+                        <thead>
+                            <tr>
+                                <th>用户名</th>
+                                <th>角色</th>
+                                <th>已审批</th>
+                                <th>注册时间</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-body"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <script src="/socket.io/socket.io.js"></script>
@@ -346,6 +446,7 @@
             let clientsState = {};
             let roleState = { mainClientId: null };
             let availableRouteClients = [];
+            let currentUser = null;
 
             const authFetch = (url, options = {}) => {
                 return fetch(url, {
@@ -399,12 +500,94 @@
                         return false;
                     }
                     const data = await resp.json();
+                    currentUser = data.user;
                     userBadgeEl.textContent = `${data.user.username} (${data.user.role})`;
+                    if (data.user.role === 'admin') {
+                        document.getElementById('user-mgmt-section').classList.add('visible');
+                        await loadUsers();
+                    }
                     return true;
                 } catch {
                     localStorage.removeItem(tokenKey);
                     window.location.href = '/auth.html';
                     return false;
+                }
+            };
+
+            const renderUsers = (users) => {
+                const tbody = document.getElementById('users-body');
+                tbody.innerHTML = '';
+                users.forEach((u) => {
+                    const isSelf = currentUser && u.id === currentUser.id;
+                    const tr = document.createElement('tr');
+                    const createdDate = new Date(u.created_at).toLocaleDateString('zh-CN');
+
+                    // 角色 select
+                    const roleSelect = document.createElement('select');
+                    ['admin', 'operator'].forEach((r) => {
+                        const opt = document.createElement('option');
+                        opt.value = r;
+                        opt.textContent = r === 'admin' ? '管理员' : '操作员';
+                        if (r === u.role) opt.selected = true;
+                        roleSelect.appendChild(opt);
+                    });
+                    if (isSelf) roleSelect.disabled = true;
+                    roleSelect.addEventListener('change', () => updateUser(u.id, { role: roleSelect.value }));
+
+                    // 审批 toggle
+                    const label = document.createElement('label');
+                    label.className = 'toggle-approved';
+                    const chk = document.createElement('input');
+                    chk.type = 'checkbox';
+                    chk.checked = u.approved;
+                    if (isSelf) chk.disabled = true;
+                    const slider = document.createElement('span');
+                    slider.className = 'slider';
+                    label.appendChild(chk);
+                    label.appendChild(slider);
+                    chk.addEventListener('change', () => updateUser(u.id, { approved: chk.checked }));
+
+                    const nameTd = document.createElement('td');
+                    nameTd.textContent = u.username;
+                    if (isSelf) {
+                        const selfTag = document.createElement('span');
+                        selfTag.className = 'tag-self';
+                        selfTag.textContent = '自己';
+                        nameTd.appendChild(selfTag);
+                    }
+
+                    const roleTd = document.createElement('td');
+                    roleTd.appendChild(roleSelect);
+
+                    const approvedTd = document.createElement('td');
+                    approvedTd.appendChild(label);
+
+                    const dateTd = document.createElement('td');
+                    dateTd.textContent = createdDate;
+
+                    tr.appendChild(nameTd);
+                    tr.appendChild(roleTd);
+                    tr.appendChild(approvedTd);
+                    tr.appendChild(dateTd);
+                    tbody.appendChild(tr);
+                });
+            };
+
+            const loadUsers = async () => {
+                const resp = await authFetch('/api/users', { method: 'GET' });
+                const data = await resp.json().catch(() => ({ ok: false, users: [] }));
+                if (data.ok) renderUsers(data.users || []);
+            };
+
+            const updateUser = async (id, patch) => {
+                const resp = await authFetch(`/api/users/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(patch),
+                });
+                const data = await resp.json().catch(() => ({ ok: false }));
+                if (!data.ok) {
+                    alert(data.message || '更新失败');
+                    await loadUsers();
                 }
             };
 

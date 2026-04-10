@@ -299,9 +299,16 @@ const initDatabase = async () => {
             username VARCHAR(64) UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             role VARCHAR(16) NOT NULL DEFAULT 'operator',
+            approved BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`,
     );
+    // 兼容旧表：若 approved 列不存在则新增
+    await dbQuery(
+        `ALTER TABLE app_users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE`,
+    );
+    // 确保已有 admin 账号自动审批
+    await dbQuery(`UPDATE app_users SET approved = TRUE WHERE role = 'admin' AND approved = FALSE`);
 
     await dbQuery(
         `CREATE TABLE IF NOT EXISTS customer_routes (
@@ -1189,13 +1196,14 @@ app.post('/api/auth/register', async (req, res) => {
         const countRes = await dbQuery('SELECT COUNT(*)::int AS n FROM app_users');
         const userCount = Number(countRes.rows[0]?.n || 0);
         const role = userCount === 0 ? 'admin' : 'operator';
+        const approved = role === 'admin';
         const passwordHash = await bcrypt.hash(password, 10);
 
         const insertRes = await dbQuery(
-            `INSERT INTO app_users (username, password_hash, role)
-             VALUES ($1, $2, $3)
-             RETURNING id, username, role`,
-            [username, passwordHash, role],
+            `INSERT INTO app_users (username, password_hash, role, approved)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, username, role, approved`,
+            [username, passwordHash, role, approved],
         );
 
         const user = insertRes.rows[0];
@@ -1222,7 +1230,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     try {
         const result = await dbQuery(
-            `SELECT id, username, role, password_hash FROM app_users WHERE username = $1 LIMIT 1`,
+            `SELECT id, username, role, approved, password_hash FROM app_users WHERE username = $1 LIMIT 1`,
             [username],
         );
 
@@ -1235,6 +1243,11 @@ app.post('/api/auth/login', async (req, res) => {
         const passOk = await bcrypt.compare(password, user.password_hash);
         if (!passOk) {
             res.status(401).json({ ok: false, message: '账号或密码错误' });
+            return;
+        }
+
+        if (!user.approved) {
+            res.status(403).json({ ok: false, message: '账号待管理员审批，暂无访问权限' });
             return;
         }
 
@@ -1409,6 +1422,72 @@ app.delete('/api/routes/:id', authRequired, async (req, res) => {
 
 app.get('/api/state', (_req, res) => {
     res.json(state);
+});
+
+// ── 用户管理 API（仅 admin）──────────────────────────────────────────────
+app.get('/api/users', authRequired, async (req, res) => {
+    if (!dbReady) { dbUnavailable(res); return; }
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+    try {
+        const result = await dbQuery(
+            `SELECT id, username, role, approved, created_at FROM app_users ORDER BY id ASC`,
+        );
+        res.json({ ok: true, users: result.rows });
+    } catch (error) {
+        log(`users 查询失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '查询失败' });
+    }
+});
+
+app.patch('/api/users/:id', authRequired, async (req, res) => {
+    if (!dbReady) { dbUnavailable(res); return; }
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+    const targetId = Number(req.params.id);
+    if (!Number.isInteger(targetId) || targetId <= 0) {
+        res.status(400).json({ ok: false, message: '用户ID非法' });
+        return;
+    }
+    const { role, approved } = req.body || {};
+    const updates = [];
+    const vals = [];
+    if (role !== undefined) {
+        if (!['admin', 'operator'].includes(role)) {
+            res.status(400).json({ ok: false, message: 'role 只能为 admin 或 operator' });
+            return;
+        }
+        vals.push(role);
+        updates.push(`role = $${vals.length}`);
+    }
+    if (approved !== undefined) {
+        vals.push(Boolean(approved));
+        updates.push(`approved = $${vals.length}`);
+    }
+    if (!updates.length) {
+        res.status(400).json({ ok: false, message: '无可更新字段' });
+        return;
+    }
+    vals.push(targetId);
+    try {
+        const result = await dbQuery(
+            `UPDATE app_users SET ${updates.join(', ')} WHERE id = $${vals.length}
+             RETURNING id, username, role, approved`,
+            vals,
+        );
+        if (!result.rows[0]) {
+            res.status(404).json({ ok: false, message: '用户不存在' });
+            return;
+        }
+        res.json({ ok: true, user: result.rows[0] });
+    } catch (error) {
+        log(`users 更新失败: ${error?.message || error}`);
+        res.status(500).json({ ok: false, message: '更新失败' });
+    }
 });
 
 app.post('/api/clients/:clientId/offline', authRequired, async (req, res) => {
