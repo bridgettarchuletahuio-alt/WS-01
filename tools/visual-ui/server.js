@@ -3011,12 +3011,15 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const avatarRows = excelRows.filter((item) =>
                 Boolean(item.avatarUrl),
             );
+            const validRows = excelRows.filter((item) =>
+                String(item.status || '') === 'valid',
+            );
             const processedCount = excelRows.length;
             const finalStoppedEarly = stoppedEarly || quotaStopped;
             const unprocessedCount =
                 Math.max(0, numbers2.length - processedCount) +
                 quotaUnprocessedCount;
-            const workbook = await buildChecknumWorkbook(avatarRows);
+            const workbook = await buildChecknumWorkbook(validRows);
             const buffer = await workbook.xlsx.writeBuffer();
             const filename = `checknum_${Date.now()}.xlsx`;
 
@@ -3030,7 +3033,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const avatarFailureSummary = summarizeAvatarFetchFailures(
                 avatarFetchFailedRows,
             );
-            const registeredCount = Math.max(0, processedCount - notRegisteredCount);
+            const registeredCount = validRows.length;
             const avatarCapabilityLimited =
                 processedCount > 0 &&
                 avatarRows.length === 0 &&
@@ -3077,7 +3080,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 userId,
                 mode,
                 processedCount,
-                avatarRows.length,
+                validRows.length,
                 finalStoppedEarly,
                 Buffer.from(inputFileContent),
                 buffer,
@@ -3085,12 +3088,12 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             );
 
             log(
-                `[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有头像 ${avatarRows.length} 条，未注册 ${notRegisteredCount} 条，无头像/隐私 ${noAvatarCount} 条，头像抓取失败 ${avatarFetchFailedCount} 条${stoppedEarly ? '（提前中止）' : ''}`,
+                `[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有效 ${validRows.length} 条（有头像 ${avatarRows.length} 条），未注册 ${notRegisteredCount} 条，无头像/隐私 ${noAvatarCount} 条，头像抓取失败 ${avatarFetchFailedCount} 条${stoppedEarly ? '（提前中止）' : ''}`,
             );
             res.json({
                 ok: true,
                 mode,
-                count: avatarRows.length,
+                count: validRows.length,
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
