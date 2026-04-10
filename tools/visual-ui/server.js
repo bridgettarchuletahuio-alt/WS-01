@@ -1064,6 +1064,31 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
 
     const raw = String(jid || '');
     const userPart = raw.split('@')[0] || '';
+    const pickHttpUrl = (value) => {
+        const v = String(value || '').trim();
+        return /^https?:\/\//i.test(v) ? v : '';
+    };
+    const extractAvatarFromContact = (contact) => {
+        if (!contact) return '';
+
+        const direct = contact.profilePicThumbObj || {};
+        const data = contact._data || {};
+        const fromData = data.profilePicThumbObj || {};
+        const candidates = [
+            direct.eurl,
+            direct.imgFull,
+            direct.img,
+            fromData.eurl,
+            fromData.imgFull,
+            fromData.img,
+        ];
+
+        for (const c of candidates) {
+            const url = pickHttpUrl(c);
+            if (url) return url;
+        }
+        return '';
+    };
     const jidCandidates = [];
     const pushCandidate = (id) => {
         const v = String(id || '').trim();
@@ -1104,18 +1129,28 @@ const resolveProfilePicWithDetail = async (jid, primaryClient = null) => {
                 // Path B: contact API (same account, alternate WA path)
                 if (typeof clientRef.getContactById === 'function') {
                     const contact = await clientRef.getContactById(candidateJid);
-                    if (
-                        contact &&
-                        typeof contact.getProfilePicUrl === 'function'
-                    ) {
-                        const urlB = await contact.getProfilePicUrl();
-                        if (urlB) {
+                    if (contact) {
+                        if (typeof contact.getProfilePicUrl === 'function') {
+                            const urlB = await contact.getProfilePicUrl();
+                            if (urlB) {
+                                return {
+                                    url: urlB,
+                                    note: '',
+                                    attempts: i + 1,
+                                };
+                            }
+                        }
+
+                        // Some sessions only expose avatar url on thumb metadata.
+                        const thumbUrl = extractAvatarFromContact(contact);
+                        if (thumbUrl) {
                             return {
-                                url: urlB,
+                                url: thumbUrl,
                                 note: '',
                                 attempts: i + 1,
                             };
                         }
+
                         lastNullFrom = 'contact';
                     }
                 }
