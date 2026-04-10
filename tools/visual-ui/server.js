@@ -1668,6 +1668,95 @@ const getTaskExecutionClients = async (
     return available;
 };
 
+const recoverAvatarsWithBackupClients = async (
+    rows,
+    preferredClientId,
+    allowedClientIds,
+    usedClientIds = new Set(),
+) => {
+    const targets = rows.filter(
+        (r) => String(r.status || '') === 'valid' && !r.avatarUrl,
+    );
+    if (!targets.length) {
+        return {
+            recoveredCount: 0,
+            attemptedClientIds: [],
+            statsDeltaByClient: {},
+        };
+    }
+
+    const allowSet =
+        Array.isArray(allowedClientIds) && allowedClientIds.length
+            ? new Set(allowedClientIds)
+            : null;
+
+    const ready = getReadyClients().filter((entry) => {
+        if (!allowSet) return true;
+        return allowSet.has(entry.clientId);
+    });
+
+    const alternates = [];
+    for (const entry of ready) {
+        if (usedClientIds.has(entry.clientId)) continue;
+
+        if (!MAINLESS_MODE && entry.clientId !== MAIN_CLIENT_ID) {
+            const guard = await ensureMainFilterLink(entry);
+            if (!guard.ok) continue;
+        }
+
+        alternates.push(entry);
+    }
+
+    if (!alternates.length) {
+        return {
+            recoveredCount: 0,
+            attemptedClientIds: [],
+            statsDeltaByClient: {},
+        };
+    }
+
+    const statsDeltaByClient = Object.fromEntries(
+        alternates.map((entry) => [entry.clientId, 0]),
+    );
+    const attemptedClientIds = alternates.map((entry) => entry.clientId);
+    let recoveredCount = 0;
+
+    for (const row of targets) {
+        for (const entry of alternates) {
+            const resolved = await resolveNumberIdWithFallback(
+                row.number,
+                preferredClientId,
+                allowedClientIds,
+                entry.client,
+                entry.clientId,
+            );
+            const numberId = resolved.numberId;
+            if (!numberId?._serialized) continue;
+
+            const avatarDetail = await resolveProfilePicWithDetail(
+                numberId._serialized,
+                resolved.clientRef || entry.client,
+                row.number,
+            );
+            if (avatarDetail.url) {
+                row.avatarUrl = avatarDetail.url;
+                row.waId = numberId._serialized;
+                row.note = `backup_avatar_ok|bot=${entry.clientId}`;
+                recoveredCount += 1;
+                statsDeltaByClient[entry.clientId] =
+                    Number(statsDeltaByClient[entry.clientId] || 0) + 1;
+                break;
+            }
+        }
+    }
+
+    return {
+        recoveredCount,
+        attemptedClientIds,
+        statsDeltaByClient,
+    };
+};
+
 const dispatchNumbersAcrossClients = async (
     numbers,
     preferredClientId,
@@ -3054,6 +3143,51 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 }
             }
 
+            const primaryUsedClientIds = new Set(
+                Object.entries(dispatch.statsByClient || {})
+                    .filter(([, v]) => Number(v) > 0)
+                    .map(([k]) => k),
+            );
+
+            const preNotRegisteredCount = excelRows.filter((r) =>
+                String(r.note || '').includes('not_registered'),
+            ).length;
+            const preNoAvatarCount = excelRows.filter((r) =>
+                String(r.note || '').includes('no_avatar'),
+            ).length;
+            const preAvatarCount = excelRows.filter((r) =>
+                Boolean(r.avatarUrl),
+            ).length;
+            const preRegisteredCount = Math.max(
+                0,
+                excelRows.length - preNotRegisteredCount,
+            );
+            const preCapabilityLimited =
+                excelRows.length > 0 &&
+                preAvatarCount === 0 &&
+                preRegisteredCount > 0 &&
+                preNoAvatarCount >= preRegisteredCount;
+
+            let backupRecoveredCount = 0;
+            let backupAttemptedClientIds = [];
+            let mergedStatsByClient = { ...(dispatch.statsByClient || {}) };
+            if (preCapabilityLimited) {
+                const recovery = await recoverAvatarsWithBackupClients(
+                    excelRows,
+                    preferredClientId,
+                    allowedClientIds,
+                    primaryUsedClientIds,
+                );
+                backupRecoveredCount = recovery.recoveredCount;
+                backupAttemptedClientIds = recovery.attemptedClientIds;
+                for (const [cid, cnt] of Object.entries(
+                    recovery.statsDeltaByClient || {},
+                )) {
+                    mergedStatsByClient[cid] =
+                        Number(mergedStatsByClient[cid] || 0) + Number(cnt || 0);
+                }
+            }
+
             const avatarRows = excelRows.filter((item) =>
                 Boolean(item.avatarUrl),
             );
@@ -3115,6 +3249,14 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     ? `${diagnosticMessage} 已忽略 ${droppedByLengthCount} 条疑似非手机号输入。`
                     : `已忽略 ${droppedByLengthCount} 条疑似非手机号输入。`;
             }
+            if (backupRecoveredCount > 0) {
+                const fromBots = backupAttemptedClientIds.length
+                    ? backupAttemptedClientIds.join(',')
+                    : '-';
+                diagnosticMessage = diagnosticMessage
+                    ? `${diagnosticMessage} 备用账号补查命中 ${backupRecoveredCount} 条（尝试账号: ${fromBots}）。`
+                    : `备用账号补查命中 ${backupRecoveredCount} 条（尝试账号: ${fromBots}）。`;
+            }
 
             await addDailyProcessedCount(userId, processedCount);
 
@@ -3143,7 +3285,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
-                statsByClient: dispatch.statsByClient,
+                statsByClient: mergedStatsByClient,
                 diagnostics: {
                     registeredCount,
                     notRegisteredCount,
@@ -3151,6 +3293,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     avatarFetchFailedCount,
                     avatarCapabilityLimited,
                     droppedByLengthCount,
+                    backupRecoveredCount,
+                    backupAttemptedClientIds,
                     avatarFetchFailureByReason:
                         avatarFailureSummary.byReason,
                     avatarFetchFailureByBot: avatarFailureSummary.byBot,
