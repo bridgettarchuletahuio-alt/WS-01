@@ -1852,7 +1852,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
 
     try {
         if (mode === 'checknum') {
-            const numbers2 = parsedNumbers.slice(0, 500);
+            const numbers2 = parsedNumbers;
             const excelRows = [];
             let stoppedEarly = false;
 
@@ -1909,7 +1909,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             });
 
         } else if (mode === 'probe') {
-            const numbers2 = [...new Set(parsedNumbers)].slice(0, 80);
+            const numbers2 = [...new Set(parsedNumbers)];
             const rows = ['number\tactivity\tack\tchannel\tnote'];
             let stoppedEarly = false;
 
@@ -1945,7 +1945,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             });
 
         } else if (mode === 'checknumlist') {
-            const numbers2 = parsedNumbers.slice(0, 500);
+            const numbers2 = parsedNumbers;
             const resultLines = [];
             let stoppedEarly = false;
 
@@ -1967,11 +1967,17 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 }
             }
 
+            const text3 = resultLines.join('\n');
             log(`[task/checknumlist] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
-            res.json({ ok: true, mode, count: resultLines.length, stoppedEarly, text: resultLines.join('\n') });
+            res.json({
+                ok: true, mode, count: resultLines.length, stoppedEarly,
+                fileContent: Buffer.from(text3).toString('base64'),
+                filename: `checknumlist_${Date.now()}.txt`,
+                mimeType: 'text/plain',
+            });
 
         } else if (mode === 'activity') {
-            const numbers2 = parsedNumbers.slice(0, 20);
+            const numbers2 = parsedNumbers;
             const resultLines = [];
             let stoppedEarly = false;
 
@@ -1994,11 +2000,21 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 }
             }
 
+            const text4 = resultLines.join('\n');
             log(`[task/activity] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
-            res.json({ ok: true, mode, count: resultLines.length, stoppedEarly, text: resultLines.join('\n') });
+            res.json({
+                ok: true, mode, count: resultLines.length, stoppedEarly,
+                fileContent: Buffer.from(text4).toString('base64'),
+                filename: `activity_${Date.now()}.txt`,
+                mimeType: 'text/plain',
+            });
 
         } else if (mode === 'wsdebug') {
-            const number = parsedNumbers[0];
+            const number = parsedNumbers[0] || '';
+            if (!number) {
+                res.status(400).json({ ok: false, message: '请提供至少一个号码' });
+                return;
+            }
             const r = await runWithExecutionClient(
                 preferredClientId,
                 (execClient) => checkActivityByWsFrames(execClient, number, 5000, { includeDebugFrames: true }),
@@ -2026,7 +2042,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             });
 
         } else if (mode === 'behavior') {
-            const numbers2 = parsedNumbers.slice(0, 20);
+            const numbers2 = parsedNumbers;
             const resultLines = [];
             let stoppedEarly = false;
 
@@ -2049,8 +2065,14 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 }
             }
 
+            const text6 = resultLines.join('\n');
             log(`[task/behavior] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
-            res.json({ ok: true, mode, count: resultLines.length, stoppedEarly, text: resultLines.join('\n') });
+            res.json({
+                ok: true, mode, count: resultLines.length, stoppedEarly,
+                fileContent: Buffer.from(text6).toString('base64'),
+                filename: `behavior_${Date.now()}.txt`,
+                mimeType: 'text/plain',
+            });
         }
     } catch (error) {
         log(`任务执行失败 [${mode}]: ${error?.message || error}`);

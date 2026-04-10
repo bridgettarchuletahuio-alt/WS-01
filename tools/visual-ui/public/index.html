@@ -551,11 +551,11 @@
                 <!-- 模式选择 -->
                 <div class="task-mode-tabs" id="task-mode-tabs">
                     <button class="task-mode-btn active" data-mode="checknum" title="检测号码是否注册+头像，返回 Excel">号码检测 (checknum)</button>
-                    <button class="task-mode-btn" data-mode="checknumlist" title="批量检测是否注册，返回文本">批量注册查询</button>
-                    <button class="task-mode-btn" data-mode="probe" title="发送探测消息检测活跃度，返回 TXT（最多80个）">活跃探测 (probe)</button>
-                    <button class="task-mode-btn" data-mode="activity" title="通过 WS 帧分析活跃度（最多20个）">WS帧活跃分析</button>
+                    <button class="task-mode-btn" data-mode="checknumlist" title="批量检测是否注册，返回 TXT">批量注册查询</button>
+                    <button class="task-mode-btn" data-mode="probe" title="发送探测消息检测活跃度，返回 TXT">活跃探测 (probe)</button>
+                    <button class="task-mode-btn" data-mode="activity" title="通过 WS 帧分析活跃度，每号约 10-15 秒">WS帧活跃分析</button>
                     <button class="task-mode-btn" data-mode="wsdebug" title="WS帧调试（仅第一个号码）">WS帧调试</button>
-                    <button class="task-mode-btn" data-mode="behavior" title="页面行为检测（最多20个）">页面行为检测</button>
+                    <button class="task-mode-btn" data-mode="behavior" title="通过页面行为检测号码有效性">页面行为检测</button>
                 </div>
 
                 <!-- 输入区 -->
@@ -1168,12 +1168,12 @@
             let taskMode = 'checknum';
 
             const taskModeDescriptions = {
-                checknum: '检测号码是否注册 WA + 获取头像，结果返回 Excel 文件（最多 500 个）',
-                checknumlist: '批量检测号码是否注册，结果显示在页面（最多 500 个）',
-                probe: '发送探测消息检测活跃度（最多 80 个），结果返回 TXT 文件',
-                activity: '通过 WS 帧分析号码活跃状态（最多 20 个），每号耗时约 10-15 秒',
+                checknum: '检测号码是否注册 WA + 获取头像，结果返回 Excel 文件',
+                checknumlist: '批量检测号码是否注册，结果返回 TXT 文件',
+                probe: '发送探测消息检测活跃度，结果返回 TXT 文件（去重处理）',
+                activity: '通过 WS 帧分析号码活跃状态，每号耗时约 10-15 秒',
                 wsdebug: 'WS 帧详细调试（仅第一个号码），用于排查分析',
-                behavior: '通过页面行为检测号码有效性（最多 20 个）',
+                behavior: '通过页面行为检测号码有效性',
             };
 
             document.querySelectorAll('.task-mode-btn').forEach((btn) => {
@@ -1218,12 +1218,14 @@
 
                 box.classList.add('visible');
 
-                const stopped = data.stoppedEarly ? '（筛选账号中途不可用，提前中止）' : '';
+                const stopped = data.stoppedEarly ? ' （筛选账号中途不可用，已中止）' : '';
                 summary.textContent = `完成：共处理 ${data.count} 条${stopped}`;
 
-                if (data.fileContent) {
+                // All results are files — build blob URL and show download button
+                const contentBase64 = data.fileContent;
+                if (contentBase64) {
                     const mime = data.mimeType || 'application/octet-stream';
-                    const byteChars = atob(data.fileContent);
+                    const byteChars = atob(contentBase64);
                     const byteArr = new Uint8Array(byteChars.length);
                     for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
                     const blob = new Blob([byteArr], { type: mime });
@@ -1232,19 +1234,18 @@
                     dlBtn.download = data.filename || 'result';
                     dlBtn.style.display = 'inline-block';
                     dlBtn.textContent = `⬇ 下载 ${data.filename || '结果文件'}`;
-                    textEl.style.display = 'none';
-                }
 
-                if (data.text) {
-                    textEl.style.display = 'block';
-                    textEl.textContent = data.text;
-                    // Also offer download for text results
-                    const blob = new Blob([data.text], { type: 'text/plain;charset=utf-8' });
-                    const url = URL.createObjectURL(blob);
-                    dlBtn.href = url;
-                    dlBtn.download = `${data.mode}_${Date.now()}.txt`;
-                    dlBtn.style.display = 'inline-block';
-                    dlBtn.textContent = '⬇ 下载结果 TXT';
+                    // Show text preview for plain-text results
+                    if (mime === 'text/plain') {
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            textEl.style.display = 'block';
+                            textEl.textContent = reader.result;
+                        };
+                        reader.readAsText(blob, 'utf-8');
+                    } else {
+                        textEl.style.display = 'none';
+                    }
                 }
             };
 
