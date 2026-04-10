@@ -1265,11 +1265,14 @@
 
                 box.classList.add('visible');
 
-                const stopped = data.stoppedEarly ? ' （筛选账号中途不可用，已中止）' : '';
+                const stopped = data.stoppedEarly
+                    ? ` （${data.message || '任务已中止'}）`
+                    : '';
+                const unchecked = Number(data.unprocessedCount || 0) > 0 ? `，未检测 ${Number(data.unprocessedCount)} 条` : '';
                 if (typeof data.processedCount === 'number') {
-                    summary.textContent = `完成：处理 ${data.processedCount} 条，回传 ${data.count} 条${stopped}`;
+                    summary.textContent = `完成：处理 ${data.processedCount} 条，回传 ${data.count} 条${unchecked}${stopped}`;
                 } else {
-                    summary.textContent = `完成：共处理 ${data.count} 条${stopped}`;
+                    summary.textContent = `完成：共处理 ${data.count} 条${unchecked}${stopped}`;
                 }
 
                 // All results are files — build blob URL and show download button

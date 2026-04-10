@@ -99,6 +99,7 @@ const AUTO_LINK_TEXT =
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_in_production';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 const DATABASE_URL = process.env.DATABASE_URL || '';
+const DAILY_DETECT_LIMIT = Number(process.env.DAILY_DETECT_LIMIT || 1000);
 
 let dbPool = null;
 let dbReady = false;
@@ -284,6 +285,33 @@ const saveTaskHistory = async (
         log(`[task-history-save-error] ${err?.message || err}`);
         return null;
     }
+};
+
+const getDailyProcessedCount = async (userId) => {
+    if (!dbReady) return 0;
+    const uid = Number(userId);
+    const result = await dbQuery(
+        `SELECT processed_count
+         FROM user_daily_quota
+         WHERE user_id = $1 AND quota_date = CURRENT_DATE
+         LIMIT 1`,
+        [uid],
+    );
+    return Number(result.rows[0]?.processed_count || 0);
+};
+
+const addDailyProcessedCount = async (userId, addCount) => {
+    if (!dbReady) return;
+    const uid = Number(userId);
+    const inc = Math.max(0, Number(addCount || 0));
+    if (!inc) return;
+    await dbQuery(
+        `INSERT INTO user_daily_quota (user_id, quota_date, processed_count)
+         VALUES ($1, CURRENT_DATE, $2)
+         ON CONFLICT (user_id, quota_date)
+         DO UPDATE SET processed_count = user_daily_quota.processed_count + EXCLUDED.processed_count`,
+        [uid, inc],
+    );
 };
 
 class MongoZipStore {
@@ -556,6 +584,21 @@ const initDatabase = async () => {
     );
     await dbQuery(
         `CREATE INDEX IF NOT EXISTS idx_task_history_created_at ON task_history(created_at)`,
+    );
+
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS user_daily_quota (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+            quota_date DATE NOT NULL,
+            processed_count INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(user_id, quota_date)
+        )`,
+    );
+    await dbQuery(
+        `CREATE INDEX IF NOT EXISTS idx_user_daily_quota_date ON user_daily_quota(quota_date)`,
     );
 
     dbReady = true;
@@ -2294,6 +2337,67 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             ? null
             : [...(userClientMap.get(Number(userId)) || new Set())];
 
+    const submittedCount = parsedNumbers.length;
+    let quotaStopped = false;
+    let quotaUnprocessedCount = 0;
+    let dailyUsed = 0;
+
+    try {
+        dailyUsed = await getDailyProcessedCount(userId);
+    } catch (quotaErr) {
+        log(`[task/quota-read-error] ${quotaErr?.message || quotaErr}`);
+        res.status(500).json({ ok: false, message: '读取每日配额失败，请稍后重试' });
+        return;
+    }
+
+    const remainingQuota = Math.max(0, DAILY_DETECT_LIMIT - dailyUsed);
+    if (submittedCount > remainingQuota) {
+        quotaStopped = true;
+        quotaUnprocessedCount = submittedCount - remainingQuota;
+        parsedNumbers = parsedNumbers.slice(0, remainingQuota);
+    }
+    const quotaStopMessage = quotaStopped
+        ? `达到每日上限 ${DAILY_DETECT_LIMIT} 条，未检测 ${quotaUnprocessedCount} 条`
+        : '';
+
+    if (!parsedNumbers.length && quotaStopped) {
+        const message = `已达到每日检测上限 ${DAILY_DETECT_LIMIT} 条，未检测 ${quotaUnprocessedCount} 条`;
+        const workbook = await buildInterruptedTaskWorkbook(mode, message, 0);
+        const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+        const filename = `${mode}_quota_${Date.now()}.xlsx`;
+        const inputFileContent = fileContent
+            ? Buffer.from(fileContent, 'base64').toString('utf-8')
+            : Array.isArray(numbers)
+              ? numbers.join('\n')
+              : String(numbers || '');
+
+        await saveTaskHistory(
+            userId,
+            mode,
+            0,
+            0,
+            true,
+            Buffer.from(inputFileContent),
+            buffer,
+            filename,
+        );
+
+        res.json({
+            ok: true,
+            mode,
+            count: 0,
+            processedCount: 0,
+            stoppedEarly: true,
+            unprocessedCount: quotaUnprocessedCount,
+            fileContent: buffer.toString('base64'),
+            filename,
+            mimeType:
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            message,
+        });
+        return;
+    }
+
     try {
         if (mode === 'checknum') {
             const numbers2 = parsedNumbers;
@@ -2350,9 +2454,16 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             const avatarRows = excelRows.filter((item) =>
                 Boolean(item.avatarUrl),
             );
+            const processedCount = excelRows.length;
+            const finalStoppedEarly = stoppedEarly || quotaStopped;
+            const unprocessedCount =
+                Math.max(0, numbers2.length - processedCount) +
+                quotaUnprocessedCount;
             const workbook = await buildChecknumWorkbook(avatarRows);
             const buffer = await workbook.xlsx.writeBuffer();
             const filename = `checknum_${Date.now()}.xlsx`;
+
+            await addDailyProcessedCount(userId, processedCount);
 
             // 保存输入和输出文件
             const inputFileContent = fileContent
@@ -2361,9 +2472,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             await saveTaskHistory(
                 userId,
                 mode,
-                excelRows.length,
+                processedCount,
                 avatarRows.length,
-                stoppedEarly,
+                finalStoppedEarly,
                 Buffer.from(inputFileContent),
                 buffer,
                 filename,
@@ -2376,8 +2487,12 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 ok: true,
                 mode,
                 count: avatarRows.length,
-                processedCount: excelRows.length,
-                stoppedEarly,
+                processedCount,
+                stoppedEarly: finalStoppedEarly,
+                unprocessedCount,
+                message: finalStoppedEarly
+                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    : '',
                 fileContent: Buffer.from(buffer).toString('base64'),
                 filename: filename,
                 mimeType:
@@ -2428,6 +2543,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
             }
 
+            const processedCount = rows.length - 1;
+            const finalStoppedEarly = stoppedEarly || quotaStopped;
+            const unprocessedCount =
+                Math.max(0, numbers2.length - processedCount) +
+                quotaUnprocessedCount;
+            await addDailyProcessedCount(userId, processedCount);
+
             // 保存输入和输出文件
             const inputFileContent = fileContent
                 ? Buffer.from(fileContent, 'base64').toString('utf-8')
@@ -2435,9 +2557,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             await saveTaskHistory(
                 userId,
                 mode,
-                numbers2.length,
-                rows.length - 1,
-                stoppedEarly,
+                processedCount,
+                processedCount,
+                finalStoppedEarly,
                 Buffer.from(inputFileContent),
                 outputBuffer,
                 filename,
@@ -2449,8 +2571,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             res.json({
                 ok: true,
                 mode,
-                count: rows.length - 1,
-                stoppedEarly,
+                count: processedCount,
+                processedCount,
+                stoppedEarly: finalStoppedEarly,
+                unprocessedCount,
+                message: finalStoppedEarly
+                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
                 mimeType,
@@ -2501,6 +2628,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
             }
 
+            const processedCount = resultLines.length;
+            const finalStoppedEarly = stoppedEarly || quotaStopped;
+            const unprocessedCount =
+                Math.max(0, numbers2.length - processedCount) +
+                quotaUnprocessedCount;
+            await addDailyProcessedCount(userId, processedCount);
+
             // 保存输入和输出文件
             const inputFileContent = fileContent
                 ? Buffer.from(fileContent, 'base64').toString('utf-8')
@@ -2508,9 +2642,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             await saveTaskHistory(
                 userId,
                 mode,
-                numbers2.length,
-                resultLines.length,
-                stoppedEarly,
+                processedCount,
+                processedCount,
+                finalStoppedEarly,
                 Buffer.from(inputFileContent),
                 outputBuffer,
                 filename,
@@ -2522,8 +2656,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             res.json({
                 ok: true,
                 mode,
-                count: resultLines.length,
-                stoppedEarly,
+                count: processedCount,
+                processedCount,
+                stoppedEarly: finalStoppedEarly,
+                unprocessedCount,
+                message: finalStoppedEarly
+                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
                 mimeType,
@@ -2583,6 +2722,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
             }
 
+            const processedCount = resultLines.length;
+            const finalStoppedEarly = stoppedEarly || quotaStopped;
+            const unprocessedCount =
+                Math.max(0, numbers2.length - processedCount) +
+                quotaUnprocessedCount;
+            await addDailyProcessedCount(userId, processedCount);
+
             // 保存输入和输出文件
             const inputFileContent = fileContent
                 ? Buffer.from(fileContent, 'base64').toString('utf-8')
@@ -2590,9 +2736,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             await saveTaskHistory(
                 userId,
                 mode,
-                numbers2.length,
-                resultLines.length,
-                stoppedEarly,
+                processedCount,
+                processedCount,
+                finalStoppedEarly,
                 Buffer.from(inputFileContent),
                 outputBuffer,
                 filename,
@@ -2604,8 +2750,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             res.json({
                 ok: true,
                 mode,
-                count: resultLines.length,
-                stoppedEarly,
+                count: processedCount,
+                processedCount,
+                stoppedEarly: finalStoppedEarly,
+                unprocessedCount,
+                message: finalStoppedEarly
+                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
                 mimeType,
@@ -2652,12 +2803,16 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 Buffer.from(text),
                 filename,
             );
+            await addDailyProcessedCount(userId, 1);
 
             log(`[task/wsdebug] 用户 ${req.user.username} 完成: ${number}`);
             res.json({
                 ok: true,
                 mode,
                 count: 1,
+                processedCount: 1,
+                unprocessedCount: quotaUnprocessedCount,
+                message: quotaStopMessage,
                 fileContent: Buffer.from(text).toString('base64'),
                 filename: filename,
                 mimeType: 'text/plain',
@@ -2708,6 +2863,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
             }
 
+            const processedCount = resultLines.length;
+            const finalStoppedEarly = stoppedEarly || quotaStopped;
+            const unprocessedCount =
+                Math.max(0, numbers2.length - processedCount) +
+                quotaUnprocessedCount;
+            await addDailyProcessedCount(userId, processedCount);
+
             // 保存输入和输出文件
             const inputFileContent = fileContent
                 ? Buffer.from(fileContent, 'base64').toString('utf-8')
@@ -2715,9 +2877,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             await saveTaskHistory(
                 userId,
                 mode,
-                numbers2.length,
-                resultLines.length,
-                stoppedEarly,
+                processedCount,
+                processedCount,
+                finalStoppedEarly,
                 Buffer.from(inputFileContent),
                 outputBuffer,
                 filename,
@@ -2729,8 +2891,13 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             res.json({
                 ok: true,
                 mode,
-                count: resultLines.length,
-                stoppedEarly,
+                count: processedCount,
+                processedCount,
+                stoppedEarly: finalStoppedEarly,
+                unprocessedCount,
+                message: finalStoppedEarly
+                    ? quotaStopMessage || '筛选账号中途不可用，已中止'
+                    : '',
                 fileContent: outputBuffer.toString('base64'),
                 filename: filename,
                 mimeType,
