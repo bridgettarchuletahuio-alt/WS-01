@@ -431,6 +431,12 @@
                 cursor: pointer;
                 text-decoration: none;
             }
+            .task-result-meta {
+                margin-top: 6px;
+                font-size: 12px;
+                color: #6b7280;
+                line-height: 1.6;
+            }
 
             .task-history-card {
                 margin-top: 16px;
@@ -619,6 +625,7 @@
                 <!-- 结果展示 -->
                 <div class="task-result-box" id="task-result-box">
                     <div style="font-size:13px;color:#374151;margin-bottom:6px" id="task-result-summary"></div>
+                    <div class="task-result-meta" id="task-result-meta" style="display:none"></div>
                     <pre class="task-result-text" id="task-result-text" style="display:none"></pre>
                     <a class="task-download-btn" id="task-download-btn" style="display:none" download>⬇ 下载结果文件</a>
                 </div>
@@ -1454,6 +1461,8 @@
                 const box = document.getElementById('task-result-box');
                 box.classList.remove('visible');
                 document.getElementById('task-result-summary').textContent = '';
+                document.getElementById('task-result-meta').style.display = 'none';
+                document.getElementById('task-result-meta').textContent = '';
                 document.getElementById('task-result-text').style.display = 'none';
                 document.getElementById('task-result-text').textContent = '';
                 document.getElementById('task-download-btn').style.display = 'none';
@@ -1462,6 +1471,7 @@
             const showTaskResult = (data) => {
                 const box = document.getElementById('task-result-box');
                 const summary = document.getElementById('task-result-summary');
+                const metaEl = document.getElementById('task-result-meta');
                 const textEl = document.getElementById('task-result-text');
                 const dlBtn = document.getElementById('task-download-btn');
 
@@ -1475,6 +1485,18 @@
                     summary.textContent = `完成：处理 ${data.processedCount} 条，回传 ${data.count} 条${unchecked}${stopped}`;
                 } else {
                     summary.textContent = `完成：共处理 ${data.count} 条${unchecked}${stopped}`;
+                }
+
+                const statsByClient = data.statsByClient || {};
+                const statItems = Object.entries(statsByClient)
+                    .filter(([, count]) => Number(count) > 0)
+                    .map(([clientId, count]) => `${clientId}: ${count}条`);
+                if (statItems.length) {
+                    metaEl.style.display = 'block';
+                    metaEl.textContent = `机器人分配统计：${statItems.join('，')}`;
+                } else {
+                    metaEl.style.display = 'none';
+                    metaEl.textContent = '';
                 }
 
                 // All results are files — build blob URL and show download button

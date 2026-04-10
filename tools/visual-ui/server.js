@@ -1299,6 +1299,9 @@ const dispatchNumbersAcrossClients = async (
 
     const output = new Array(numbers.length);
     const stopState = { stopped: false, reason: '' };
+    const statsByClient = Object.fromEntries(
+        clients.map((entry) => [entry.clientId, 0]),
+    );
 
     await Promise.all(
         clients.map(async (entry, bucketIdx) => {
@@ -1310,6 +1313,7 @@ const dispatchNumbersAcrossClients = async (
                         item.number,
                         entry.clientId,
                     );
+                    statsByClient[entry.clientId] += 1;
                     output[item.idx] = {
                         number: item.number,
                         value,
@@ -1325,6 +1329,7 @@ const dispatchNumbersAcrossClients = async (
                     if (isExecutionClientUnavailableError(error)) {
                         contactGuardCache.delete(entry.clientId);
                     }
+                    statsByClient[entry.clientId] += 1;
                     output[item.idx] = {
                         number: item.number,
                         value: null,
@@ -1343,6 +1348,7 @@ const dispatchNumbersAcrossClients = async (
         stoppedEarly: stopState.stopped,
         stopMessage: stopState.reason,
         unprocessedCount: Math.max(0, numbers.length - results.length),
+        statsByClient,
     };
 };
 
@@ -2637,6 +2643,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
+                statsByClient: dispatch.statsByClient,
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
@@ -2724,6 +2731,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
+                statsByClient: dispatch.statsByClient,
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
@@ -2812,6 +2820,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
+                statsByClient: dispatch.statsByClient,
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
@@ -2908,6 +2917,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
+                statsByClient: dispatch.statsByClient,
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
@@ -2966,6 +2976,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 count: 1,
                 processedCount: 1,
                 unprocessedCount: quotaUnprocessedCount,
+                statsByClient: { [preferredClientId || 'single']: 1 },
                 message: quotaStopMessage,
                 fileContent: Buffer.from(text).toString('base64'),
                 filename: filename,
@@ -3051,6 +3062,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount,
                 stoppedEarly: finalStoppedEarly,
                 unprocessedCount,
+                statsByClient: dispatch.statsByClient,
                 message: finalStoppedEarly
                     ? quotaStopMessage || dispatch.stopMessage || '筛选账号中途不可用，已中止'
                     : '',
