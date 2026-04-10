@@ -1455,11 +1455,26 @@ const getReadyFilterClients = (allowedClientIds = null) => {
         Array.isArray(allowedClientIds) && allowedClientIds.length
             ? new Set(allowedClientIds)
             : null;
-    return getReadyClients().filter((entry) => {
-        if (!MAINLESS_MODE && entry.clientId === MAIN_CLIENT_ID) return false;
+    const readyAll = getReadyClients().filter((entry) => {
         if (!allowSet) return true;
         return allowSet.has(entry.clientId);
     });
+
+    const filterReady = readyAll.filter((entry) => {
+        if (!MAINLESS_MODE && entry.clientId === MAIN_CLIENT_ID) return false;
+        return true;
+    });
+    if (filterReady.length) return filterReady;
+
+    // 兜底：当筛选账号不可用时，自动回落主账号执行，避免 authenticated 但任务不可跑。
+    if (!MAINLESS_MODE) {
+        const mainReady = readyAll.find(
+            (entry) => entry.clientId === MAIN_CLIENT_ID,
+        );
+        if (mainReady) return [mainReady];
+    }
+
+    return [];
 };
 
 const buildClientJid = (entry) => {
@@ -1559,8 +1574,10 @@ const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
     let sawRuntimeUnavailable = false;
 
     for (const selected of ordered) {
-        const guard = await ensureMainFilterLink(selected);
-        if (!guard.ok) continue;
+        if (!MAINLESS_MODE && selected.clientId !== MAIN_CLIENT_ID) {
+            const guard = await ensureMainFilterLink(selected);
+            if (!guard.ok) continue;
+        }
 
         try {
             rrCursor = (rrCursor + 1) % Math.max(ready.length, 1);
@@ -1614,8 +1631,11 @@ const getTaskExecutionClients = async (
 
     const available = [];
     for (const selected of ordered) {
-        const guard = await ensureMainFilterLink(selected);
-        if (guard.ok) available.push(selected);
+        if (!MAINLESS_MODE && selected.clientId !== MAIN_CLIENT_ID) {
+            const guard = await ensureMainFilterLink(selected);
+            if (!guard.ok) continue;
+        }
+        available.push(selected);
     }
 
     if (!available.length) {
