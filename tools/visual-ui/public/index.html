@@ -1262,8 +1262,10 @@
 
                 const body = { mode: taskMode, clientId: clientSelect.value || undefined };
 
-                // Try file first
-                if (fileInput.files && fileInput.files.length > 0) {
+                // 手动输入优先：避免上一次选择的文件残留导致本次仍走文件解析
+                if (numbersInput.value.trim()) {
+                    body.numbers = numbersInput.value;
+                } else if (fileInput.files && fileInput.files.length > 0) {
                     const file = fileInput.files[0];
                     if (file.size > 6 * 1024 * 1024) {
                         errEl.textContent = '文件过大，请上传 6MB 以内的 TXT 文件';
@@ -1279,8 +1281,6 @@
                         errEl.textContent = '文件读取失败，请重试';
                         return;
                     }
-                } else if (numbersInput.value.trim()) {
-                    body.numbers = numbersInput.value;
                 } else {
                     errEl.textContent = '请上传 TXT 文件或在文本框输入号码';
                     return;

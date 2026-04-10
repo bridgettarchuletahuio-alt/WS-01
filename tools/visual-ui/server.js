@@ -1876,26 +1876,31 @@ app.post('/api/task/run', authRequired, async (req, res) => {
         return;
     }
 
-    // 解析号码
+    // 解析号码：优先尝试文件，失败或为空时自动回退到手动输入
     let parsedNumbers = [];
     if (fileContent) {
         try {
-            const buffer = Buffer.from(String(fileContent), 'base64');
+            const raw = String(fileContent || '').trim();
+            const normalizedBase64 = raw.replace(/^data:[^;]+;base64,/i, '');
+            const buffer = Buffer.from(normalizedBase64, 'base64');
             parsedNumbers = extractPhoneNumbersFromBuffer(buffer);
         } catch {
             res.status(400).json({ ok: false, message: 'TXT文件解析失败' });
             return;
         }
-    } else if (Array.isArray(numbers)) {
+    }
+
+    // 文件未提取到号码时，回退到 numbers 字段继续尝试
+    if (!parsedNumbers.length && Array.isArray(numbers)) {
         parsedNumbers = numbers
             .map((n) => normalizePhoneInput(String(n || '')))
             .filter((n) => n.length >= 6);
-    } else if (typeof numbers === 'string' && numbers.trim()) {
+    } else if (!parsedNumbers.length && typeof numbers === 'string' && numbers.trim()) {
         parsedNumbers = extractPhoneNumbers(numbers);
     }
 
     if (!parsedNumbers.length) {
-        res.status(400).json({ ok: false, message: '未能提取到有效电话号码，请检查格式' });
+        res.status(400).json({ ok: false, message: '未能提取到有效电话号码。请确认每行含数字，或直接粘贴号码文本再试。' });
         return;
     }
 
