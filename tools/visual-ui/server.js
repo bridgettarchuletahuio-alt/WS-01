@@ -1361,6 +1361,8 @@ const setClientState = (clientId, patch) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json({ limit: '8mb' }));
+app.use(express.urlencoded({ extended: true, limit: '8mb' }));
+app.use(express.text({ type: ['text/plain'], limit: '8mb' }));
 
 app.post('/api/auth/register', async (req, res) => {
     if (!dbReady) {
@@ -1921,7 +1923,14 @@ app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
 const VALID_TASK_MODES = ['checknum', 'probe', 'checknumlist', 'activity', 'wsdebug', 'behavior'];
 
 app.post('/api/task/run', authRequired, async (req, res) => {
-    const { mode, numbers, fileContent, clientId: preferredClientId } = req.body || {};
+    const payload = typeof req.body === 'string'
+        ? { numbers: req.body }
+        : (req.body || {});
+
+    const mode = String(payload.mode || '').trim();
+    const numbers = payload.numbers ?? payload.text ?? payload.content ?? '';
+    const fileContent = payload.fileContent ?? payload.file ?? payload.base64 ?? '';
+    const preferredClientId = payload.clientId;
     const userId = req.user.sub;
     const userRole = req.user.role;
 
@@ -1952,7 +1961,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
 
     if (!parsedNumbers.length) {
         log(
-            `[task/parse-empty] mode=${mode} user=${req.user.username} fileContent=${fileContent ? 'yes' : 'no'} numbersType=${Array.isArray(numbers) ? 'array' : typeof numbers} numbersLen=${typeof numbers === 'string' ? numbers.length : Array.isArray(numbers) ? numbers.length : 0}`,
+            `[task/parse-empty] mode=${mode} user=${req.user.username} ct=${req.headers['content-type'] || '-'} fileContent=${fileContent ? 'yes' : 'no'} numbersType=${Array.isArray(numbers) ? 'array' : typeof numbers} numbersLen=${typeof numbers === 'string' ? numbers.length : Array.isArray(numbers) ? numbers.length : 0}`,
         );
         res.status(400).json({ ok: false, message: '未能提取到有效电话号码。请确认每行含数字，或直接粘贴号码文本再试。' });
         return;
