@@ -1198,12 +1198,36 @@
                 errEl.textContent = '';
 
                 try {
-                    const text = await file.text();
-                    if (text && text.trim()) {
-                        numbersInput.value = text;
+                    const arrayBuf = await file.arrayBuffer();
+                    const bytes = new Uint8Array(arrayBuf);
+
+                    if (!bytes.length) {
+                        errEl.textContent = '该TXT文件为空，请更换文件';
+                        return;
+                    }
+
+                    // 尝试多种编码回填文本：UTF-8 / UTF-16LE / 文件默认 text()
+                    const candidates = [];
+                    try {
+                        candidates.push(new TextDecoder('utf-8', { fatal: false }).decode(bytes));
+                    } catch {}
+                    try {
+                        candidates.push(new TextDecoder('utf-16le', { fatal: false }).decode(bytes));
+                    } catch {}
+                    try {
+                        candidates.push(await file.text());
+                    } catch {}
+
+                    const scoreDigits = (s) => (String(s || '').match(/\d/g) || []).length;
+                    candidates.sort((a, b) => scoreDigits(b) - scoreDigits(a));
+                    const best = candidates[0] || '';
+
+                    // 即使无法可靠解码，后端仍可走 fileContent 二进制解析
+                    if (best && best.trim()) {
+                        numbersInput.value = best;
                         statusText.textContent = `已读取文件: ${file.name} (${Math.ceil(file.size / 1024)}KB)`;
                     } else {
-                        errEl.textContent = '该TXT文件为空或不可读，请更换文件';
+                        statusText.textContent = `已选择文件: ${file.name} (${Math.ceil(file.size / 1024)}KB)，将使用二进制上传解析`;
                     }
                 } catch {
                     errEl.textContent = '读取TXT失败，请重选文件';
