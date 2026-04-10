@@ -25,7 +25,9 @@ const AUTH_DIR = process.env.WWEBJS_AUTH_DIR
     : path.resolve(process.cwd(), '.wwebjs_auth');
 const REMOTE_AUTH_ENABLED =
     String(process.env.REMOTE_AUTH_ENABLED || 'false').toLowerCase() === 'true';
-const REMOTE_AUTH_STORE = String(process.env.REMOTE_AUTH_STORE || 'postgres').toLowerCase();
+const REMOTE_AUTH_STORE = String(
+    process.env.REMOTE_AUTH_STORE || 'postgres',
+).toLowerCase();
 const REMOTE_AUTH_MONGO_URI =
     process.env.REMOTE_AUTH_MONGO_URI || process.env.MONGODB_URI || '';
 const REMOTE_AUTH_DB_NAME = process.env.REMOTE_AUTH_DB_NAME || 'wwebjs';
@@ -37,7 +39,8 @@ const REMOTE_AUTH_DATA_PATH = process.env.REMOTE_AUTH_DATA_PATH
 const REMOTE_AUTH_BACKUP_INTERVAL_MS = Number(
     process.env.REMOTE_AUTH_BACKUP_INTERVAL_MS || 300000,
 );
-const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH;
+const CHROMIUM_PATH =
+    process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH;
 const CLIENT_IDS = String(process.env.WWEBJS_CLIENT_IDS || 'visual-ui')
     .split(',')
     .map((item) => item.trim())
@@ -82,12 +85,15 @@ const contactGuardCache = new Map();
 let rrCursor = 0;
 
 const makeChatScopeKey = (clientId, chatId) => `${clientId}::${chatId}`;
-const AVATAR_FETCH_TIMEOUT_MS = Number(process.env.AVATAR_FETCH_TIMEOUT_MS || 12000);
+const AVATAR_FETCH_TIMEOUT_MS = Number(
+    process.env.AVATAR_FETCH_TIMEOUT_MS || 12000,
+);
 const CONTACT_GUARD_CACHE_TTL_MS = Number(
     process.env.CONTACT_GUARD_CACHE_TTL_MS || 21600000,
 );
 const AUTO_LINK_FILTER_BOTS =
-    String(process.env.AUTO_LINK_FILTER_BOTS || 'true').toLowerCase() === 'true';
+    String(process.env.AUTO_LINK_FILTER_BOTS || 'true').toLowerCase() ===
+    'true';
 const AUTO_LINK_TEXT =
     process.env.AUTO_LINK_TEXT || '系统建联消息（机器人自动发送），可忽略。';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_in_production';
@@ -99,7 +105,9 @@ let dbReady = false;
 let remoteMongoClient = null;
 let remoteSessionStore = null;
 const chatRouteCache = new Map();
-const CHAT_ROUTE_CACHE_TTL_MS = Number(process.env.CHAT_ROUTE_CACHE_TTL_MS || 120000);
+const CHAT_ROUTE_CACHE_TTL_MS = Number(
+    process.env.CHAT_ROUTE_CACHE_TTL_MS || 120000,
+);
 
 // userId → Set<clientId>：操作员被分配的 WA 账号绑定（内存缓存）
 const userClientMap = new Map();
@@ -167,7 +175,10 @@ const issueToken = (user) => {
 };
 
 const dbUnavailable = (res) => {
-    res.status(503).json({ ok: false, message: '数据库未启用，请先配置 DATABASE_URL' });
+    res.status(503).json({
+        ok: false,
+        message: '数据库未启用，请先配置 DATABASE_URL',
+    });
 };
 
 const authRequired = async (req, res, next) => {
@@ -191,6 +202,90 @@ const dbQuery = async (sql, params = []) => {
     return dbPool.query(sql, params);
 };
 
+// 保存任务历史记录到数据库（仅限已认证用户）
+// ===== 文件存储与管理 =====
+const ensureTaskFilesDir = async () => {
+    const baseDir = path.join(path.dirname(__filename), 'data', 'task-files');
+    try {
+        await fs.mkdir(baseDir, { recursive: true });
+    } catch (e) {
+        // dir already exists, ignore
+        log(`[ensureTaskFilesDir] 目录已创建: ${baseDir}`);
+    }
+    return baseDir;
+};
+
+const getTaskFileDir = async (timestamp = Date.now()) => {
+    const baseDir = await ensureTaskFilesDir();
+    const date = new Date(timestamp);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dayDir = path.join(baseDir, year.toString(), month, day);
+    try {
+        await fs.mkdir(dayDir, { recursive: true });
+    } catch (e) {
+        // dir already exists, ignore
+        log(`[getTaskFileDir] 目录已存在: ${dayDir}`);
+    }
+    return dayDir;
+};
+
+const saveTaskHistory = async (
+    userId,
+    mode,
+    inputCount,
+    outputCount,
+    stoppedEarly = false,
+    inputFileBuffer = null,
+    outputFileBuffer = null,
+    outputFilename = null,
+) => {
+    if (!dbReady) return null;
+    let inputPath = null,
+        outputPath = null;
+
+    try {
+        const uid = Number(userId);
+        const dayDir = await getTaskFileDir();
+        const timestamp = Date.now();
+
+        // 保存输入文件
+        if (inputFileBuffer) {
+            const inputFile = `input_${timestamp}_${mode}.txt`;
+            inputPath = path.join(dayDir, inputFile);
+            await fs.writeFile(inputPath, inputFileBuffer);
+        }
+
+        // 保存输出文件
+        if (outputFileBuffer && outputFilename) {
+            const outputFile = `output_${timestamp}_${outputFilename}`;
+            outputPath = path.join(dayDir, outputFile);
+            await fs.writeFile(outputPath, outputFileBuffer);
+        }
+
+        // 保存历史记录
+        const result = await dbQuery(
+            `INSERT INTO task_history (user_id, mode, input_count, output_count, stopped_early, input_file_path, output_file_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id`,
+            [
+                uid,
+                mode,
+                inputCount,
+                outputCount,
+                stoppedEarly,
+                inputPath,
+                outputPath,
+            ],
+        );
+        return result.rows[0]?.id;
+    } catch (err) {
+        log(`[task-history-save-error] ${err?.message || err}`);
+        return null;
+    }
+};
+
 class MongoZipStore {
     constructor({ mongoClient, dbName, collectionName, dataPath }) {
         this.mongoClient = mongoClient;
@@ -201,7 +296,10 @@ class MongoZipStore {
     }
 
     async sessionExists({ session }) {
-        const count = await this.collection.countDocuments({ session }, { limit: 1 });
+        const count = await this.collection.countDocuments(
+            { session },
+            { limit: 1 },
+        );
         return count > 0;
     }
 
@@ -268,7 +366,9 @@ class PostgresZipStore {
     }
 
     async delete({ session }) {
-        await dbQuery(`DELETE FROM remote_sessions WHERE session = $1`, [session]);
+        await dbQuery(`DELETE FROM remote_sessions WHERE session = $1`, [
+            session,
+        ]);
     }
 }
 
@@ -295,7 +395,9 @@ const initRemoteAuthStore = async () => {
     }
 
     if (!dbPool) {
-        throw new Error('REMOTE_AUTH_STORE=postgres 需要先配置并连接 DATABASE_URL');
+        throw new Error(
+            'REMOTE_AUTH_STORE=postgres 需要先配置并连接 DATABASE_URL',
+        );
     }
 
     await dbQuery(
@@ -339,7 +441,9 @@ const initDatabase = async () => {
     }
 
     const useSsl =
-        String(process.env.PGSSL || process.env.PGSSLMODE || '').toLowerCase() === 'require' ||
+        String(
+            process.env.PGSSL || process.env.PGSSLMODE || '',
+        ).toLowerCase() === 'require' ||
         String(process.env.PG_SSL || 'true').toLowerCase() === 'true';
 
     dbPool = new Pool({
@@ -362,7 +466,9 @@ const initDatabase = async () => {
         `ALTER TABLE app_users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE`,
     );
     // 确保已有 admin 账号自动审批
-    await dbQuery(`UPDATE app_users SET approved = TRUE WHERE role = 'admin' AND approved = FALSE`);
+    await dbQuery(
+        `UPDATE app_users SET approved = TRUE WHERE role = 'admin' AND approved = FALSE`,
+    );
 
     await dbQuery(
         `CREATE TABLE IF NOT EXISTS customer_routes (
@@ -399,7 +505,9 @@ const initDatabase = async () => {
         );
     }
     // 加载 DB 中额外添加的账号（不在环境变量里的）
-    const mcRes = await dbQuery(`SELECT client_id FROM managed_clients ORDER BY id ASC`);
+    const mcRes = await dbQuery(
+        `SELECT client_id FROM managed_clients ORDER BY id ASC`,
+    );
     for (const row of mcRes.rows) {
         if (!CLIENT_IDS.includes(row.client_id)) {
             CLIENT_IDS.push(row.client_id);
@@ -417,6 +525,38 @@ const initDatabase = async () => {
     );
     // 加载绑定关系到内存
     await reloadUserClientBindings();
+
+    // ── task_history：任务执行历史记录（用于管理员审计） ──────────────────
+    await dbQuery(
+        `CREATE TABLE IF NOT EXISTS task_history (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+            mode VARCHAR(32) NOT NULL,
+            input_count INTEGER NOT NULL,
+            output_count INTEGER NOT NULL,
+            stopped_early BOOLEAN NOT NULL DEFAULT FALSE,
+            input_file_path TEXT,
+            output_file_path TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`,
+    );
+    // 若表已存在但缺少 input_file_path/output_file_path 列，则添加
+    try {
+        await dbQuery(
+            `ALTER TABLE task_history ADD COLUMN IF NOT EXISTS input_file_path TEXT`,
+        );
+        await dbQuery(
+            `ALTER TABLE task_history ADD COLUMN IF NOT EXISTS output_file_path TEXT`,
+        );
+    } catch (e) {
+        // 列已存在，忽略
+    }
+    await dbQuery(
+        `CREATE INDEX IF NOT EXISTS idx_task_history_user_id ON task_history(user_id)`,
+    );
+    await dbQuery(
+        `CREATE INDEX IF NOT EXISTS idx_task_history_created_at ON task_history(created_at)`,
+    );
 
     dbReady = true;
     log('PostgreSQL 已连接，注册与客户路由功能已启用。');
@@ -629,9 +769,16 @@ const decodeWsPayload = (payload, opcode) => {
 };
 
 const decodeFramesViaService = async (base64Frames) => {
-    const serviceUrl = process.env.WS_DECODE_URL || 'http://127.0.0.1:3000/decode';
+    const serviceUrl =
+        process.env.WS_DECODE_URL || 'http://127.0.0.1:3000/decode';
     if (!Array.isArray(base64Frames) || !base64Frames.length) {
-        return { ok: false, reason: 'no_frames', decoded: 0, hits: 0, samples: [] };
+        return {
+            ok: false,
+            reason: 'no_frames',
+            decoded: 0,
+            hits: 0,
+            samples: [],
+        };
     }
 
     try {
@@ -700,10 +847,13 @@ const decodeFramesViaService = async (base64Frames) => {
 };
 
 const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS || 45000);
-const PROBE_TEXT =
-    process.env.PROBE_TEXT || '系统连通性测试消息，请忽略。';
+const PROBE_TEXT = process.env.PROBE_TEXT || '系统连通性测试消息，请忽略。';
 
-const waitForMessageAck = (clientRef, targetMsgId, timeoutMs = PROBE_TIMEOUT_MS) => {
+const waitForMessageAck = (
+    clientRef,
+    targetMsgId,
+    timeoutMs = PROBE_TIMEOUT_MS,
+) => {
     return new Promise((resolve) => {
         let done = false;
         let bestAck = null;
@@ -833,9 +983,10 @@ const getReadyClients = () => {
 };
 
 const getReadyFilterClients = (allowedClientIds = null) => {
-    const allowSet = Array.isArray(allowedClientIds) && allowedClientIds.length
-        ? new Set(allowedClientIds)
-        : null;
+    const allowSet =
+        Array.isArray(allowedClientIds) && allowedClientIds.length
+            ? new Set(allowedClientIds)
+            : null;
     return getReadyClients().filter((entry) => {
         if (entry.clientId === MAIN_CLIENT_ID) return false;
         if (!allowSet) return true;
@@ -922,13 +1073,20 @@ const runWithExecutionClient = async (preferredClientId, fn, options = {}) => {
         throw new Error('暂无可用筛选账号，请先登录其他WS账号作为筛选账号');
     }
 
-    const preferred = ready.find((entry) => entry.clientId === preferredClientId);
+    const preferred = ready.find(
+        (entry) => entry.clientId === preferredClientId,
+    );
     const rrOrdered = [
         ...ready.slice(rrCursor % ready.length),
         ...ready.slice(0, rrCursor % ready.length),
     ];
     const ordered = preferred
-        ? [preferred, ...rrOrdered.filter((item) => item.clientId !== preferred.clientId)]
+        ? [
+              preferred,
+              ...rrOrdered.filter(
+                  (item) => item.clientId !== preferred.clientId,
+              ),
+          ]
         : rrOrdered;
 
     let sawRuntimeUnavailable = false;
@@ -1032,7 +1190,8 @@ const extractNumbersFromText = (text) => {
     }
 
     // Strategy C: pattern extraction (for mixed text lines)
-    const pattern = /(?:\+?[\d\u0660-\u0669\u06f0-\u06f9][\d\u0660-\u0669\u06f0-\u06f9 \t().-]{4,}[\d\u0660-\u0669\u06f0-\u06f9])/g;
+    const pattern =
+        /(?:\+?[\d\u0660-\u0669\u06f0-\u06f9][\d\u0660-\u0669\u06f0-\u06f9 \t().-]{4,}[\d\u0660-\u0669\u06f0-\u06f9])/g;
     const matches = normalized.match(pattern) || [];
     for (const m of matches) {
         const digits = normalizePhoneInput(m);
@@ -1149,7 +1308,10 @@ const checkActivityByWsFrames = async (
             binaryFramePayloads.push(String(payload));
         }
 
-        const { normalizedText, debugSummary } = decodeWsPayload(payload, opcode);
+        const { normalizedText, debugSummary } = decodeWsPayload(
+            payload,
+            opcode,
+        );
         decodedFrames++;
 
         if (decodedSamples.length < 25) {
@@ -1162,9 +1324,13 @@ const checkActivityByWsFrames = async (
         if (!keywords.some((k) => text.includes(k))) return;
 
         // Prefer strict number-hint matches, but allow presence/status-like frames as soft evidence.
-        const strongHit = numberHints.some((hint) => text.includes(hint.toLowerCase()));
+        const strongHit = numberHints.some((hint) =>
+            text.includes(hint.toLowerCase()),
+        );
         const softHit =
-            text.includes('presence') || text.includes('last') || text.includes('status');
+            text.includes('presence') ||
+            text.includes('last') ||
+            text.includes('status');
         if (!strongHit && !softHit) return;
 
         keywordHits.push(text.slice(0, 600));
@@ -1370,11 +1536,16 @@ app.post('/api/auth/register', async (req, res) => {
         return;
     }
 
-    const username = String(req.body?.username || '').trim().toLowerCase();
+    const username = String(req.body?.username || '')
+        .trim()
+        .toLowerCase();
     const password = String(req.body?.password || '');
 
     if (!/^[a-z0-9_]{3,32}$/.test(username)) {
-        res.status(400).json({ ok: false, message: '用户名需为3-32位字母数字下划线' });
+        res.status(400).json({
+            ok: false,
+            message: '用户名需为3-32位字母数字下划线',
+        });
         return;
     }
     if (password.length < 6) {
@@ -1383,7 +1554,9 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     try {
-        const countRes = await dbQuery('SELECT COUNT(*)::int AS n FROM app_users');
+        const countRes = await dbQuery(
+            'SELECT COUNT(*)::int AS n FROM app_users',
+        );
         const userCount = Number(countRes.rows[0]?.n || 0);
         const role = userCount === 0 ? 'admin' : 'operator';
         const approved = role === 'admin';
@@ -1415,7 +1588,9 @@ app.post('/api/auth/login', async (req, res) => {
         return;
     }
 
-    const username = String(req.body?.username || '').trim().toLowerCase();
+    const username = String(req.body?.username || '')
+        .trim()
+        .toLowerCase();
     const password = String(req.body?.password || '');
 
     try {
@@ -1437,7 +1612,10 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         if (!user.approved) {
-            res.status(403).json({ ok: false, message: '账号待管理员审批，暂无访问权限' });
+            res.status(403).json({
+                ok: false,
+                message: '账号待管理员审批，暂无访问权限',
+            });
             return;
         }
 
@@ -1506,7 +1684,13 @@ app.get('/api/routes', authRequired, async (req, res) => {
             ownerUserId: row.owner_user_id,
             updatedAt: row.updated_at,
         }));
-        res.json({ ok: true, items, availableClientIds: CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID) });
+        res.json({
+            ok: true,
+            items,
+            availableClientIds: CLIENT_IDS.filter(
+                (id) => id !== MAIN_CLIENT_ID,
+            ),
+        });
     } catch (error) {
         log(`routes 查询失败: ${error?.message || error}`);
         res.status(500).json({ ok: false, message: '查询路由失败' });
@@ -1521,10 +1705,15 @@ app.post('/api/routes', authRequired, async (req, res) => {
 
     const chatId = String(req.body?.chatId || '').trim();
     const demandTag = String(req.body?.demandTag || '').trim();
-    const clientIds = parseClientIdList(req.body?.clientIds).filter((id) => id !== MAIN_CLIENT_ID);
+    const clientIds = parseClientIdList(req.body?.clientIds).filter(
+        (id) => id !== MAIN_CLIENT_ID,
+    );
 
     if (!chatId || !demandTag) {
-        res.status(400).json({ ok: false, message: 'chatId 与 demandTag 必填' });
+        res.status(400).json({
+            ok: false,
+            message: 'chatId 与 demandTag 必填',
+        });
         return;
     }
 
@@ -1541,9 +1730,14 @@ app.post('/api/routes', authRequired, async (req, res) => {
 
         if (existing.rows[0]) {
             const route = existing.rows[0];
-            const canEdit = req.user.role === 'admin' || Number(route.owner_user_id) === Number(req.user.sub);
+            const canEdit =
+                req.user.role === 'admin' ||
+                Number(route.owner_user_id) === Number(req.user.sub);
             if (!canEdit) {
-                res.status(403).json({ ok: false, message: '无权限修改该路由' });
+                res.status(403).json({
+                    ok: false,
+                    message: '无权限修改该路由',
+                });
                 return;
             }
 
@@ -1595,7 +1789,9 @@ app.delete('/api/routes/:id', authRequired, async (req, res) => {
             return;
         }
 
-        const canDelete = req.user.role === 'admin' || Number(row.owner_user_id) === Number(req.user.sub);
+        const canDelete =
+            req.user.role === 'admin' ||
+            Number(row.owner_user_id) === Number(req.user.sub);
         if (!canDelete) {
             res.status(403).json({ ok: false, message: '无权限删除该路由' });
             return;
@@ -1616,7 +1812,10 @@ app.get('/api/state', (_req, res) => {
 
 // ── 用户管理 API（仅 admin）──────────────────────────────────────────────
 app.get('/api/users', authRequired, async (req, res) => {
-    if (!dbReady) { dbUnavailable(res); return; }
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
     if (req.user.role !== 'admin') {
         res.status(403).json({ ok: false, message: '无权限' });
         return;
@@ -1634,17 +1833,27 @@ app.get('/api/users', authRequired, async (req, res) => {
 
 // Admin 手动创建用户
 app.post('/api/users', authRequired, async (req, res) => {
-    if (!dbReady) { dbUnavailable(res); return; }
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
     if (req.user.role !== 'admin') {
         res.status(403).json({ ok: false, message: '无权限' });
         return;
     }
-    const username = String(req.body?.username || '').trim().toLowerCase();
+    const username = String(req.body?.username || '')
+        .trim()
+        .toLowerCase();
     const password = String(req.body?.password || '');
-    const role = ['admin', 'operator'].includes(req.body?.role) ? req.body.role : 'operator';
+    const role = ['admin', 'operator'].includes(req.body?.role)
+        ? req.body.role
+        : 'operator';
 
     if (!/^[a-z0-9_]{3,32}$/.test(username)) {
-        res.status(400).json({ ok: false, message: '用户名需为3-32位字母数字下划线' });
+        res.status(400).json({
+            ok: false,
+            message: '用户名需为3-32位字母数字下划线',
+        });
         return;
     }
     if (password.length < 6) {
@@ -1672,7 +1881,10 @@ app.post('/api/users', authRequired, async (req, res) => {
 });
 
 app.patch('/api/users/:id', authRequired, async (req, res) => {
-    if (!dbReady) { dbUnavailable(res); return; }
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
     if (req.user.role !== 'admin') {
         res.status(403).json({ ok: false, message: '无权限' });
         return;
@@ -1687,7 +1899,10 @@ app.patch('/api/users/:id', authRequired, async (req, res) => {
     const vals = [];
     if (role !== undefined) {
         if (!['admin', 'operator'].includes(role)) {
-            res.status(400).json({ ok: false, message: 'role 只能为 admin 或 operator' });
+            res.status(400).json({
+                ok: false,
+                message: 'role 只能为 admin 或 operator',
+            });
             return;
         }
         vals.push(role);
@@ -1786,20 +2001,38 @@ app.post('/api/clients/:clientId/online', authRequired, async (req, res) => {
 // ── 用户 WA 账号绑定管理（admin）─────────────────────────────────────────
 // 查询某用户已绑定的账号列表
 app.get('/api/users/:id/clients', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') { res.status(403).json({ ok: false, message: '无权限' }); return; }
-    if (!dbReady) { dbUnavailable(res); return; }
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
     const uid = Number(req.params.id);
-    const result = await dbQuery(`SELECT client_id FROM user_clients WHERE user_id = $1`, [uid]);
+    const result = await dbQuery(
+        `SELECT client_id FROM user_clients WHERE user_id = $1`,
+        [uid],
+    );
     res.json({ ok: true, clientIds: result.rows.map((r) => r.client_id) });
 });
 
 // 绑定账号
 app.post('/api/users/:id/clients', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') { res.status(403).json({ ok: false, message: '无权限' }); return; }
-    if (!dbReady) { dbUnavailable(res); return; }
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '无权限' });
+        return;
+    }
+    if (!dbReady) {
+        dbUnavailable(res);
+        return;
+    }
     const uid = Number(req.params.id);
     const clientId = String(req.body?.clientId || '').trim();
-    if (!clientId) { res.status(400).json({ ok: false, message: 'clientId 不能为空' }); return; }
+    if (!clientId) {
+        res.status(400).json({ ok: false, message: 'clientId 不能为空' });
+        return;
+    }
     try {
         await dbQuery(
             `INSERT INTO user_clients (user_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
@@ -1809,25 +2042,44 @@ app.post('/api/users/:id/clients', authRequired, async (req, res) => {
         broadcastClients();
         res.json({ ok: true });
     } catch (error) {
-        res.status(500).json({ ok: false, message: error?.message || '绑定失败' });
+        res.status(500).json({
+            ok: false,
+            message: error?.message || '绑定失败',
+        });
     }
 });
 
 // 解绑账号
-app.delete('/api/users/:id/clients/:clientId', authRequired, async (req, res) => {
-    if (req.user.role !== 'admin') { res.status(403).json({ ok: false, message: '无权限' }); return; }
-    if (!dbReady) { dbUnavailable(res); return; }
-    const uid = Number(req.params.id);
-    const clientId = req.params.clientId;
-    try {
-        await dbQuery(`DELETE FROM user_clients WHERE user_id = $1 AND client_id = $2`, [uid, clientId]);
-        await reloadUserClientBindings();
-        broadcastClients();
-        res.json({ ok: true });
-    } catch (error) {
-        res.status(500).json({ ok: false, message: error?.message || '解绑失败' });
-    }
-});
+app.delete(
+    '/api/users/:id/clients/:clientId',
+    authRequired,
+    async (req, res) => {
+        if (req.user.role !== 'admin') {
+            res.status(403).json({ ok: false, message: '无权限' });
+            return;
+        }
+        if (!dbReady) {
+            dbUnavailable(res);
+            return;
+        }
+        const uid = Number(req.params.id);
+        const clientId = req.params.clientId;
+        try {
+            await dbQuery(
+                `DELETE FROM user_clients WHERE user_id = $1 AND client_id = $2`,
+                [uid, clientId],
+            );
+            await reloadUserClientBindings();
+            broadcastClients();
+            res.json({ ok: true });
+        } catch (error) {
+            res.status(500).json({
+                ok: false,
+                message: error?.message || '解绑失败',
+            });
+        }
+    },
+);
 
 // ── 动态添加账号（admin）
 
@@ -1835,7 +2087,10 @@ app.post('/api/clients', authRequired, async (req, res) => {
     // 所有已登录用户均可添加账号，账号自动绑定到创建者
     const clientId = String(req.body?.clientId || '').trim();
     if (!/^[a-zA-Z0-9_-]{2,64}$/.test(clientId)) {
-        res.status(400).json({ ok: false, message: '账号ID只能包含字母/数字/下划线/横线，长度2-64' });
+        res.status(400).json({
+            ok: false,
+            message: '账号ID只能包含字母/数字/下划线/横线，长度2-64',
+        });
         return;
     }
     if (clientPool.has(clientId)) {
@@ -1901,7 +2156,9 @@ app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
         if (idx !== -1) CLIENT_IDS.splice(idx, 1);
 
         if (dbReady) {
-            await dbQuery(`DELETE FROM managed_clients WHERE client_id = $1`, [clientId]);
+            await dbQuery(`DELETE FROM managed_clients WHERE client_id = $1`, [
+                clientId,
+            ]);
             // user_clients 通过 ON DELETE CASCADE 自动清理
         }
         await reloadUserClientBindings();
@@ -1920,16 +2177,23 @@ app.delete('/api/clients/:clientId', authRequired, async (req, res) => {
 });
 
 // ── UI 任务执行 API ────────────────────────────────────────────────────────
-const VALID_TASK_MODES = ['checknum', 'probe', 'checknumlist', 'activity', 'wsdebug', 'behavior'];
+const VALID_TASK_MODES = [
+    'checknum',
+    'probe',
+    'checknumlist',
+    'activity',
+    'wsdebug',
+    'behavior',
+];
 
 app.post('/api/task/run', authRequired, async (req, res) => {
-    const payload = typeof req.body === 'string'
-        ? { numbers: req.body }
-        : (req.body || {});
+    const payload =
+        typeof req.body === 'string' ? { numbers: req.body } : req.body || {};
 
     const mode = String(payload.mode || '').trim();
     const numbers = payload.numbers ?? payload.text ?? payload.content ?? '';
-    const fileContent = payload.fileContent ?? payload.file ?? payload.base64 ?? '';
+    const fileContent =
+        payload.fileContent ?? payload.file ?? payload.base64 ?? '';
     const preferredClientId = payload.clientId;
     const userId = req.user.sub;
     const userRole = req.user.role;
@@ -1955,21 +2219,37 @@ app.post('/api/task/run', authRequired, async (req, res) => {
         parsedNumbers = numbers
             .map((n) => normalizePhoneInput(String(n || '')))
             .filter((n) => n.length >= 6);
-    } else if (!parsedNumbers.length && typeof numbers === 'string' && numbers.trim()) {
+    } else if (
+        !parsedNumbers.length &&
+        typeof numbers === 'string' &&
+        numbers.trim()
+    ) {
         parsedNumbers = extractPhoneNumbers(numbers);
     }
 
     if (!parsedNumbers.length) {
         const numbersLen =
-            typeof numbers === 'string' ? numbers.length : Array.isArray(numbers) ? numbers.length : 0;
+            typeof numbers === 'string'
+                ? numbers.length
+                : Array.isArray(numbers)
+                  ? numbers.length
+                  : 0;
         log(
             `[task/parse-empty] mode=${mode} user=${req.user.username} ct=${req.headers['content-type'] || '-'} fileContent=${fileContent ? 'yes' : 'no'} numbersType=${Array.isArray(numbers) ? 'array' : typeof numbers} numbersLen=${numbersLen}`,
         );
         if (!fileContent && numbersLen === 0) {
-            res.status(400).json({ ok: false, message: '未接收到文件内容。请刷新页面后重新选择TXT，或先把内容回填到输入框再执行。' });
+            res.status(400).json({
+                ok: false,
+                message:
+                    '未接收到文件内容。请刷新页面后重新选择TXT，或先把内容回填到输入框再执行。',
+            });
             return;
         }
-        res.status(400).json({ ok: false, message: '未能提取到有效电话号码。请确认每行含数字，或直接粘贴号码文本再试。' });
+        res.status(400).json({
+            ok: false,
+            message:
+                '未能提取到有效电话号码。请确认每行含数字，或直接粘贴号码文本再试。',
+        });
         return;
     }
 
@@ -2002,7 +2282,9 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                             const maybeAvatar = await runWithExecutionClient(
                                 preferredClientId,
                                 (execClient) =>
-                                    execClient.getProfilePicUrl(numberId._serialized),
+                                    execClient.getProfilePicUrl(
+                                        numberId._serialized,
+                                    ),
                                 { allowedClientIds },
                             );
                             avatarUrl = maybeAvatar || '';
@@ -2020,14 +2302,41 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         stoppedEarly = true;
                         break;
                     }
-                    excelRows.push({ number, status: 'error', waId: '-', avatarUrl: '', note: error?.message || 'check_failed' });
+                    excelRows.push({
+                        number,
+                        status: 'error',
+                        waId: '-',
+                        avatarUrl: '',
+                        note: error?.message || 'check_failed',
+                    });
                 }
             }
 
-            const avatarRows = excelRows.filter((item) => Boolean(item.avatarUrl));
+            const avatarRows = excelRows.filter((item) =>
+                Boolean(item.avatarUrl),
+            );
             const workbook = await buildChecknumWorkbook(avatarRows);
             const buffer = await workbook.xlsx.writeBuffer();
-            log(`[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有头像 ${avatarRows.length} 条${stoppedEarly ? '（提前中止）' : ''}`);
+            const filename = `checknum_${Date.now()}.xlsx`;
+
+            // 保存输入和输出文件
+            const inputFileContent = fileContent
+                ? Buffer.from(fileContent, 'base64').toString('utf-8')
+                : numbers2.join('\n');
+            await saveTaskHistory(
+                userId,
+                mode,
+                excelRows.length,
+                avatarRows.length,
+                stoppedEarly,
+                Buffer.from(inputFileContent),
+                buffer,
+                filename,
+            );
+
+            log(
+                `[task/checknum] 用户 ${req.user.username} 完成，处理 ${excelRows.length} 条，回传有头像 ${avatarRows.length} 条${stoppedEarly ? '（提前中止）' : ''}`,
+            );
             res.json({
                 ok: true,
                 mode,
@@ -2035,10 +2344,10 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 processedCount: excelRows.length,
                 stoppedEarly,
                 fileContent: Buffer.from(buffer).toString('base64'),
-                filename: `checknum_${Date.now()}.xlsx`,
-                mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                filename: filename,
+                mimeType:
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             });
-
         } else if (mode === 'probe') {
             const numbers2 = [...new Set(parsedNumbers)];
             const rows = ['number\tactivity\tack\tchannel\tnote'];
@@ -2048,7 +2357,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 try {
                     const result = await runWithExecutionClient(
                         preferredClientId,
-                        (execClient) => runProbeForNumber(execClient, number, PROBE_TEXT),
+                        (execClient) =>
+                            runProbeForNumber(execClient, number, PROBE_TEXT),
                         { allowedClientIds },
                     );
                     rows.push(
@@ -2064,17 +2374,35 @@ app.post('/api/task/run', authRequired, async (req, res) => {
             }
 
             const text = rows.join('\n');
-            log(`[task/probe] 用户 ${req.user.username} 完成，共 ${rows.length - 1} 条${stoppedEarly ? '（提前中止）' : ''}`);
+            const filename = `probe_${Date.now()}.txt`;
+
+            // 保存输入和输出文件
+            const inputFileContent = fileContent
+                ? Buffer.from(fileContent, 'base64').toString('utf-8')
+                : numbers2.join('\n');
+            await saveTaskHistory(
+                userId,
+                mode,
+                numbers2.length,
+                rows.length - 1,
+                stoppedEarly,
+                Buffer.from(inputFileContent),
+                Buffer.from(text),
+                filename,
+            );
+
+            log(
+                `[task/probe] 用户 ${req.user.username} 完成，共 ${rows.length - 1} 条${stoppedEarly ? '（提前中止）' : ''}`,
+            );
             res.json({
                 ok: true,
                 mode,
                 count: rows.length - 1,
                 stoppedEarly,
                 fileContent: Buffer.from(text).toString('base64'),
-                filename: `probe_${Date.now()}.txt`,
+                filename: filename,
                 mimeType: 'text/plain',
             });
-
         } else if (mode === 'checknumlist') {
             const numbers2 = parsedNumbers;
             const resultLines = [];
@@ -2088,25 +2416,50 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         { allowedClientIds },
                     );
                     const waId = numberId?._serialized || '';
-                    resultLines.push(`${number}\t${numberId ? 'registered' : 'unregistered'}\t${waId}`);
+                    resultLines.push(
+                        `${number}\t${numberId ? 'registered' : 'unregistered'}\t${waId}`,
+                    );
                 } catch (error) {
                     if (isDispatchUnavailableError(error)) {
                         stoppedEarly = true;
                         break;
                     }
-                    resultLines.push(`${number}\terror\t${error?.message || 'failed'}`);
+                    resultLines.push(
+                        `${number}\terror\t${error?.message || 'failed'}`,
+                    );
                 }
             }
 
             const text3 = resultLines.join('\n');
-            log(`[task/checknumlist] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
+            const filename = `checknumlist_${Date.now()}.txt`;
+
+            // 保存输入和输出文件
+            const inputFileContent = fileContent
+                ? Buffer.from(fileContent, 'base64').toString('utf-8')
+                : numbers2.join('\n');
+            await saveTaskHistory(
+                userId,
+                mode,
+                numbers2.length,
+                resultLines.length,
+                stoppedEarly,
+                Buffer.from(inputFileContent),
+                Buffer.from(text3),
+                filename,
+            );
+
+            log(
+                `[task/checknumlist] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`,
+            );
             res.json({
-                ok: true, mode, count: resultLines.length, stoppedEarly,
+                ok: true,
+                mode,
+                count: resultLines.length,
+                stoppedEarly,
                 fileContent: Buffer.from(text3).toString('base64'),
-                filename: `checknumlist_${Date.now()}.txt`,
+                filename: filename,
                 mimeType: 'text/plain',
             });
-
         } else if (mode === 'activity') {
             const numbers2 = parsedNumbers;
             const resultLines = [];
@@ -2116,7 +2469,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 try {
                     const r = await runWithExecutionClient(
                         preferredClientId,
-                        (execClient) => checkActivityByWsFrames(execClient, number, 5000),
+                        (execClient) =>
+                            checkActivityByWsFrames(execClient, number, 5000),
                         { allowedClientIds },
                     );
                     resultLines.push(
@@ -2127,28 +2481,57 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         stoppedEarly = true;
                         break;
                     }
-                    resultLines.push(`${number}\terror\t${error?.message || 'failed'}`);
+                    resultLines.push(
+                        `${number}\terror\t${error?.message || 'failed'}`,
+                    );
                 }
             }
 
             const text4 = resultLines.join('\n');
-            log(`[task/activity] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
+            const filename = `activity_${Date.now()}.txt`;
+
+            // 保存输入和输出文件
+            const inputFileContent = fileContent
+                ? Buffer.from(fileContent, 'base64').toString('utf-8')
+                : numbers2.join('\n');
+            await saveTaskHistory(
+                userId,
+                mode,
+                numbers2.length,
+                resultLines.length,
+                stoppedEarly,
+                Buffer.from(inputFileContent),
+                Buffer.from(text4),
+                filename,
+            );
+
+            log(
+                `[task/activity] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`,
+            );
             res.json({
-                ok: true, mode, count: resultLines.length, stoppedEarly,
+                ok: true,
+                mode,
+                count: resultLines.length,
+                stoppedEarly,
                 fileContent: Buffer.from(text4).toString('base64'),
-                filename: `activity_${Date.now()}.txt`,
+                filename: filename,
                 mimeType: 'text/plain',
             });
-
         } else if (mode === 'wsdebug') {
             const number = parsedNumbers[0] || '';
             if (!number) {
-                res.status(400).json({ ok: false, message: '请提供至少一个号码' });
+                res.status(400).json({
+                    ok: false,
+                    message: '请提供至少一个号码',
+                });
                 return;
             }
             const r = await runWithExecutionClient(
                 preferredClientId,
-                (execClient) => checkActivityByWsFrames(execClient, number, 5000, { includeDebugFrames: true }),
+                (execClient) =>
+                    checkActivityByWsFrames(execClient, number, 5000, {
+                        includeDebugFrames: true,
+                    }),
                 { allowedClientIds },
             );
             const lines = [
@@ -2162,16 +2545,30 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 ...(r.debugFrames || []),
             ];
             const text = lines.join('\n');
+            const filename = `wsdebug_${number}_${Date.now()}.txt`;
+
+            // 保存输入和输出文件
+            const inputFileContent = number;
+            await saveTaskHistory(
+                userId,
+                mode,
+                1,
+                1,
+                false,
+                Buffer.from(inputFileContent),
+                Buffer.from(text),
+                filename,
+            );
+
             log(`[task/wsdebug] 用户 ${req.user.username} 完成: ${number}`);
             res.json({
                 ok: true,
                 mode,
                 count: 1,
                 fileContent: Buffer.from(text).toString('base64'),
-                filename: `wsdebug_${number}_${Date.now()}.txt`,
+                filename: filename,
                 mimeType: 'text/plain',
             });
-
         } else if (mode === 'behavior') {
             const numbers2 = parsedNumbers;
             const resultLines = [];
@@ -2181,7 +2578,8 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                 try {
                     const r = await runWithExecutionClient(
                         preferredClientId,
-                        (execClient) => checkNumberBehavior(execClient, number, 5000),
+                        (execClient) =>
+                            checkNumberBehavior(execClient, number, 5000),
                         { allowedClientIds },
                     );
                     resultLines.push(
@@ -2192,16 +2590,40 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                         stoppedEarly = true;
                         break;
                     }
-                    resultLines.push(`${number}\terror\t${error?.message || 'failed'}`);
+                    resultLines.push(
+                        `${number}\terror\t${error?.message || 'failed'}`,
+                    );
                 }
             }
 
             const text6 = resultLines.join('\n');
-            log(`[task/behavior] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`);
+            const filename = `behavior_${Date.now()}.txt`;
+
+            // 保存输入和输出文件
+            const inputFileContent = fileContent
+                ? Buffer.from(fileContent, 'base64').toString('utf-8')
+                : numbers2.join('\n');
+            await saveTaskHistory(
+                userId,
+                mode,
+                numbers2.length,
+                resultLines.length,
+                stoppedEarly,
+                Buffer.from(inputFileContent),
+                Buffer.from(text6),
+                filename,
+            );
+
+            log(
+                `[task/behavior] 用户 ${req.user.username} 完成，共 ${resultLines.length} 条`,
+            );
             res.json({
-                ok: true, mode, count: resultLines.length, stoppedEarly,
+                ok: true,
+                mode,
+                count: resultLines.length,
+                stoppedEarly,
                 fileContent: Buffer.from(text6).toString('base64'),
-                filename: `behavior_${Date.now()}.txt`,
+                filename: filename,
                 mimeType: 'text/plain',
             });
         }
@@ -2210,14 +2632,297 @@ app.post('/api/task/run', authRequired, async (req, res) => {
         if (isDispatchUnavailableError(error)) {
             res.status(503).json({ ok: false, message: error.message });
         } else {
-            res.status(500).json({ ok: false, message: error?.message || '任务执行失败' });
+            res.status(500).json({
+                ok: false,
+                message: error?.message || '任务执行失败',
+            });
         }
+    }
+});
+
+// ── 管理员文件管理 API ────────────────────────────────────────────────────────
+
+// 列出任务历史和文件
+app.get('/api/admin/task-history', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '仅管理员可访问' });
+        return;
+    }
+
+    try {
+        const userId = req.query.user_id ? Number(req.query.user_id) : null;
+        const mode = req.query.mode ? String(req.query.mode).trim() : null;
+        const limit = Math.min(Number(req.query.limit) || 100, 1000);
+        const offset = Number(req.query.offset) || 0;
+
+        let query =
+            'SELECT id, user_id, (SELECT username FROM app_users WHERE id = task_history.user_id) as username, mode, input_count, output_count, stopped_early, input_file_path, output_file_path, created_at FROM task_history WHERE 1=1';
+        const params = [];
+
+        if (userId) {
+            query += ` AND user_id = $${params.length + 1}`;
+            params.push(userId);
+        }
+        if (mode) {
+            query += ` AND mode = $${params.length + 1}`;
+            params.push(mode);
+        }
+
+        query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+        params.push(limit, offset);
+
+        const result = await dbQuery(query, params);
+        const countResult = await dbQuery(
+            `SELECT COUNT(*) as total FROM task_history WHERE 1=1 ${userId ? 'AND user_id = $1' : ''} ${mode ? (userId ? 'AND' : 'WHERE') + ' mode = $' + (userId ? 2 : 1) : ''}`,
+            userId && mode
+                ? [userId, mode]
+                : userId
+                  ? [userId]
+                  : mode
+                    ? [mode]
+                    : [],
+        );
+
+        res.json({
+            ok: true,
+            total: Number(countResult.rows[0].total),
+            limit,
+            offset,
+            items: result.rows,
+        });
+    } catch (error) {
+        log(`[admin/task-history] 错误: ${error?.message || error}`);
+        res.status(500).json({
+            ok: false,
+            message: error?.message || '查询失败',
+        });
+    }
+});
+
+// 下载单个任务文件
+app.get(
+    '/api/admin/task-files/:taskId/:fileType',
+    authRequired,
+    async (req, res) => {
+        if (req.user.role !== 'admin') {
+            res.status(403).json({ ok: false, message: '仅管理员可访问' });
+            return;
+        }
+
+        try {
+            const taskId = Number(req.params.taskId);
+            const fileType = String(req.params.fileType).toLowerCase(); // 'input' or 'output'
+
+            if (!['input', 'output'].includes(fileType)) {
+                res.status(400).json({ ok: false, message: '无效的文件类型' });
+                return;
+            }
+
+            const result = await dbQuery(
+                `SELECT ${fileType}_file_path as filepath, mode, created_at FROM task_history WHERE id = $1`,
+                [taskId],
+            );
+
+            if (!result.rows.length) {
+                res.status(404).json({ ok: false, message: '任务记录未找到' });
+                return;
+            }
+
+            const record = result.rows[0];
+            const filepath = record.filepath;
+
+            if (!filepath) {
+                res.status(404).json({ ok: false, message: '文件未保存' });
+                return;
+            }
+
+            // 安全性检查：确保路径在预期目录内
+            const baseDir = path.join(
+                path.dirname(__filename),
+                'data',
+                'task-files',
+            );
+            const normalizedPath = path.normalize(filepath);
+            const normalizedBase = path.normalize(baseDir);
+
+            if (!normalizedPath.startsWith(normalizedBase)) {
+                res.status(403).json({ ok: false, message: '访问被拒绝' });
+                return;
+            }
+
+            // 检查文件是否存在
+            try {
+                await fs.access(filepath, fs.constants.R_OK);
+            } catch {
+                res.status(404).json({ ok: false, message: '文件不存在' });
+                return;
+            }
+
+            // 生成合适的文件名
+            const dateStr = new Date(record.created_at)
+                .toISOString()
+                .slice(0, 10);
+            const ext =
+                fileType === 'input'
+                    ? '.txt'
+                    : filepath.includes('.xlsx')
+                      ? '.xlsx'
+                      : '.txt';
+            const filename = `${fileType}_${record.mode}_${dateStr}_${taskId}${ext}`;
+
+            res.download(filepath, filename);
+        } catch (error) {
+            log(`[admin/task-files] 下载错误: ${error?.message || error}`);
+            res.status(500).json({
+                ok: false,
+                message: error?.message || '下载失败',
+            });
+        }
+    },
+);
+
+// 导出所有任务文件到 ZIP
+app.post('/api/admin/task-files/export', authRequired, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        res.status(403).json({ ok: false, message: '仅管理员可访问' });
+        return;
+    }
+
+    try {
+        const userId = req.body?.user_id ? Number(req.body.user_id) : null;
+        const mode = req.body?.mode ? String(req.body.mode).trim() : null;
+        const fromDate = req.body?.from_date
+            ? new Date(req.body.from_date)
+            : null;
+        const toDate = req.body?.to_date ? new Date(req.body.to_date) : null;
+
+        let query =
+            'SELECT id, user_id, (SELECT username FROM app_users WHERE id = task_history.user_id) as username, mode, input_file_path, output_file_path, created_at FROM task_history WHERE 1=1';
+        const params = [];
+
+        if (userId) {
+            query += ` AND user_id = $${params.length + 1}`;
+            params.push(userId);
+        }
+        if (mode) {
+            query += ` AND mode = $${params.length + 1}`;
+            params.push(mode);
+        }
+        if (fromDate) {
+            query += ` AND created_at >= $${params.length + 1}`;
+            params.push(fromDate.toISOString());
+        }
+        if (toDate) {
+            query += ` AND created_at <= $${params.length + 1}`;
+            params.push(toDate.toISOString());
+        }
+
+        query += ` ORDER BY created_at DESC`;
+
+        const result = await dbQuery(query, params);
+        const records = result.rows;
+
+        if (!records.length) {
+            res.status(404).json({ ok: false, message: '没有匹配的任务记录' });
+            return;
+        }
+
+        // 使用 archiver 创建 ZIP（需要已安装）
+        let Archive;
+        try {
+            Archive = require('archiver');
+        } catch (e) {
+            res.status(500).json({
+                ok: false,
+                message: '系统缺少 archiver 模块，无法创建 ZIP',
+            });
+            return;
+        }
+
+        const zipName = `task-files-export-${Date.now()}.zip`;
+        const zipPath = path.join(path.dirname(__filename), 'data', zipName);
+
+        try {
+            await ensureTaskFilesDir();
+        } catch (e) {
+            // dir creation failed, continue anyway
+            log(`[export] 创建 ZIP 目录失败: ${e?.message || e}`);
+        }
+
+        const output = fsSync.createWriteStream(zipPath);
+        const archive = new Archive('zip', { zlib: { level: 9 } });
+
+        archive.on('error', (err) => {
+            throw err;
+        });
+
+        archive.pipe(output);
+
+        // 添加所有文件到 ZIP
+        for (const record of records) {
+            const date = new Date(record.created_at).toISOString().slice(0, 10);
+            const username = record.username || `user_${record.user_id}`;
+            const folderPrefix = `${username}/${date}/${record.mode}`;
+
+            if (record.input_file_path) {
+                try {
+                    await fs.access(record.input_file_path, fs.constants.R_OK);
+                    archive.file(record.input_file_path, {
+                        name: `${folderPrefix}/input_${record.id}.txt`,
+                    });
+                } catch (e) {
+                    // 文件不存在，跳过此文件
+                    log(`[export] 输入文件不存在: ${record.input_file_path}`);
+                }
+            }
+
+            if (record.output_file_path) {
+                try {
+                    await fs.access(record.output_file_path, fs.constants.R_OK);
+                    const outputExt = record.output_file_path.includes('.xlsx')
+                        ? '.xlsx'
+                        : '.txt';
+                    archive.file(record.output_file_path, {
+                        name: `${folderPrefix}/output_${record.id}${outputExt}`,
+                    });
+                } catch (e) {
+                    // 文件不存在，跳过此文件
+                    log(`[export] 输出文件不存在: ${record.output_file_path}`);
+                }
+            }
+        }
+
+        await archive.finalize();
+
+        // 等待流完成
+        return new Promise((resolve, reject) => {
+            output.on('close', () => {
+                res.download(zipPath, zipName, (err) => {
+                    if (err) reject(err);
+                    else {
+                        // 下载完成后删除临时文件
+                        fs.unlink(zipPath).catch((e) =>
+                            log(`[cleanup] ZIP删除失败: ${e}`),
+                        );
+                        resolve();
+                    }
+                });
+            });
+            output.on('error', reject);
+        });
+    } catch (error) {
+        log(`[admin/task-files/export] 导出错误: ${error?.message || error}`);
+        res.status(500).json({
+            ok: false,
+            message: error?.message || '导出失败',
+        });
     }
 });
 
 // Socket.IO 认证中间件
 io.use((socket, next) => {
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token || '';
+    const token =
+        socket.handshake.auth?.token || socket.handshake.query?.token || '';
     if (!token) {
         // 未认证仍允许连接，但 data.user 为空（只收到公共事件）
         return next();
@@ -2257,7 +2962,10 @@ const buildClient = (clientId) => {
         ? new RemoteAuth({
               clientId,
               dataPath: REMOTE_AUTH_DATA_PATH,
-              backupSyncIntervalMs: Math.max(REMOTE_AUTH_BACKUP_INTERVAL_MS, 60000),
+              backupSyncIntervalMs: Math.max(
+                  REMOTE_AUTH_BACKUP_INTERVAL_MS,
+                  60000,
+              ),
               store: remoteSessionStore,
           })
         : new LocalAuth({ clientId, dataPath: AUTH_DIR });
@@ -2332,7 +3040,9 @@ const buildClient = (clientId) => {
     });
 
     if (clientId === MAIN_CLIENT_ID) {
-        client.on('message', (msg) => handleCommandMessage(msg, client, clientId));
+        client.on('message', (msg) =>
+            handleCommandMessage(msg, client, clientId),
+        );
         client.on('message_create', (msg) =>
             handleCommandMessage(msg, client, clientId),
         );
@@ -2355,7 +3065,9 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 
     const chatId = msg.from;
     const chatScopeKey = makeChatScopeKey(currentClientId, chatId);
-    const routeClientIds = await getChatRouteClientIds(chatId).catch(() => null);
+    const routeClientIds = await getChatRouteClientIds(chatId).catch(
+        () => null,
+    );
 
     if (
         awaitingTxtModeByChat.has(chatScopeKey) &&
@@ -2421,7 +3133,11 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                         const result = await runWithExecutionClient(
                             currentClientId,
                             (execClient) =>
-                                runProbeForNumber(execClient, number, PROBE_TEXT),
+                                runProbeForNumber(
+                                    execClient,
+                                    number,
+                                    PROBE_TEXT,
+                                ),
                             { allowedClientIds: scopedClientIds },
                         );
                         rows.push(
@@ -2438,12 +3154,16 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                     }
                 }
                 if (stoppedByDispatcher) {
-                    rows.push('----\t----\t----\t----\tdispatcher_unavailable_stopped');
+                    rows.push(
+                        '----\t----\t----\t----\tdispatcher_unavailable_stopped',
+                    );
                 }
                 resultName = `probe-result-${Date.now()}.txt`;
             } else {
                 if (!getReadyFilterClients(scopedClientIds).length) {
-                    await msg.reply('暂无可用筛选账号，请先上线至少一个筛选账号后重试。');
+                    await msg.reply(
+                        '暂无可用筛选账号，请先上线至少一个筛选账号后重试。',
+                    );
                     awaitingTxtModeByChat.delete(chatScopeKey);
                     log(`checknum 无可用筛选账号: ${chatId}`);
                     return;
@@ -2469,12 +3189,15 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                         let note = '';
                         if (numberId?._serialized) {
                             try {
-                                const maybeAvatar = await runWithExecutionClient(
-                                    currentClientId,
-                                    (execClient) =>
-                                        execClient.getProfilePicUrl(numberId._serialized),
-                                    { allowedClientIds: scopedClientIds },
-                                );
+                                const maybeAvatar =
+                                    await runWithExecutionClient(
+                                        currentClientId,
+                                        (execClient) =>
+                                            execClient.getProfilePicUrl(
+                                                numberId._serialized,
+                                            ),
+                                        { allowedClientIds: scopedClientIds },
+                                    );
                                 avatarUrl = maybeAvatar || '';
                                 if (!avatarUrl) {
                                     note = 'no_avatar';
@@ -2509,14 +3232,18 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                     }
                 }
 
-                const avatarRows = excelRows.filter((item) => Boolean(item.avatarUrl));
+                const avatarRows = excelRows.filter((item) =>
+                    Boolean(item.avatarUrl),
+                );
                 const workbook = await buildChecknumWorkbook(avatarRows);
                 resultName = `checknum-result-${Date.now()}.xlsx`;
                 const resultPath = path.join(os.tmpdir(), resultName);
                 await workbook.xlsx.writeFile(resultPath);
 
                 const resultMedia = MessageMedia.fromFilePath(resultPath);
-                await msg.reply(resultMedia, null, { sendMediaAsDocument: true });
+                await msg.reply(resultMedia, null, {
+                    sendMediaAsDocument: true,
+                });
                 await msg.reply(
                     stoppedByDispatcher
                         ? `筛选账号中途异常，已回传当前成功结果（已处理${excelRows.length}条，仅回传有头像${avatarRows.length}条）。`
@@ -2548,7 +3275,9 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                         : `活跃探测完成，结果已通过TXT回传（${rows.length - 1}条）。`,
                 );
             } else {
-                await msg.reply(`检测完成，结果已通过TXT回传（${numbers.length}条）。`);
+                await msg.reply(
+                    `检测完成，结果已通过TXT回传（${numbers.length}条）。`,
+                );
             }
 
             await fs.unlink(resultPath).catch(() => {});
@@ -2601,7 +3330,9 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
             .filter(Boolean);
 
         if (!getReadyFilterClients(routeClientIds).length) {
-            await msg.reply('暂无可用筛选账号，请先上线至少一个筛选账号再执行批量检测。');
+            await msg.reply(
+                '暂无可用筛选账号，请先上线至少一个筛选账号再执行批量检测。',
+            );
             log('checknumlist 无可用筛选账号');
             return;
         }
@@ -2630,10 +3361,9 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
         }
 
         await msg.reply(
-            [
-                `批量检测完成，共 ${uniqueNumbers.length} 个号码:`,
-                ...lines,
-            ].join('\n'),
+            [`批量检测完成，共 ${uniqueNumbers.length} 个号码:`, ...lines].join(
+                '\n',
+            ),
         );
         log(`checknumlist 已处理: ${uniqueNumbers.length} 个号码`);
         return;
@@ -2655,7 +3385,8 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 
             const result = await runWithExecutionClient(
                 currentClientId,
-                (execClient) => checkActivityByWsFrames(execClient, number, 4000),
+                (execClient) =>
+                    checkActivityByWsFrames(execClient, number, 4000),
                 { allowedClientIds: routeClientIds },
             );
             if (!result.ok) {
@@ -2732,7 +3463,9 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 
             try {
                 const debugMedia = MessageMedia.fromFilePath(debugPath);
-                await msg.reply(debugMedia, null, { sendMediaAsDocument: true });
+                await msg.reply(debugMedia, null, {
+                    sendMediaAsDocument: true,
+                });
                 await msg.reply('已回传 WebSocket 解码摘要 TXT。');
             } catch (sendErr) {
                 await msg.reply(
@@ -2741,7 +3474,9 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
                         ...rows.slice(0, 35),
                     ].join('\n'),
                 );
-                log(`wsdebug 文档发送失败，已降级文本: ${sendErr?.message || sendErr}`);
+                log(
+                    `wsdebug 文档发送失败，已降级文本: ${sendErr?.message || sendErr}`,
+                );
             }
 
             await fs.unlink(debugPath).catch(() => {});
@@ -2830,14 +3565,17 @@ async function handleCommandMessage(msg, clientRef, currentClientId) {
 
             const result = await runWithExecutionClient(
                 currentClientId,
-                (execClient) => runProbeForNumber(execClient, number, probeText),
+                (execClient) =>
+                    runProbeForNumber(execClient, number, probeText),
                 { allowedClientIds: routeClientIds },
             );
             if (result.activity === 'not_exist') {
                 await msg.reply(
-                    [`号码: ${number}`, '探测结果: not_exist', '说明: 号码未注册'].join(
-                        '\n',
-                    ),
+                    [
+                        `号码: ${number}`,
+                        '探测结果: not_exist',
+                        '说明: 号码未注册',
+                    ].join('\n'),
                 );
                 log(`probe 未注册: ${number}`);
                 return;
@@ -2905,7 +3643,9 @@ async function start() {
         const filterIds = CLIENT_IDS.filter((id) => id !== MAIN_CLIENT_ID);
         log(`账号池已配置: ${CLIENT_IDS.join(', ')}`);
         log(`主机器人账号: ${MAIN_CLIENT_ID}`);
-        log(`筛选账号: ${filterIds.length ? filterIds.join(', ') : '(未配置)'}`);
+        log(
+            `筛选账号: ${filterIds.length ? filterIds.join(', ') : '(未配置)'}`,
+        );
     });
 
     for (const clientId of CLIENT_IDS) {
