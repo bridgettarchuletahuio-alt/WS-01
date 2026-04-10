@@ -1187,6 +1187,29 @@
                 });
             });
 
+            // 上传文件后，立即把文本回填到输入框，防止 fileContent 丢失导致空请求
+            document.getElementById('task-file-input').addEventListener('change', async (e) => {
+                const file = e.target.files && e.target.files[0];
+                if (!file) return;
+
+                const errEl = document.getElementById('task-error');
+                const statusText = document.getElementById('task-status-text');
+                const numbersInput = document.getElementById('task-numbers-input');
+                errEl.textContent = '';
+
+                try {
+                    const text = await file.text();
+                    if (text && text.trim()) {
+                        numbersInput.value = text;
+                        statusText.textContent = `已读取文件: ${file.name} (${Math.ceil(file.size / 1024)}KB)`;
+                    } else {
+                        errEl.textContent = '该TXT文件为空或不可读，请更换文件';
+                    }
+                } catch {
+                    errEl.textContent = '读取TXT失败，请重选文件';
+                }
+            });
+
             const renderTaskClientSelect = () => {
                 const sel = document.getElementById('task-client-select');
                 const prev = sel.value;

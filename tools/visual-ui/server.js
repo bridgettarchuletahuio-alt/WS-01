@@ -1960,9 +1960,15 @@ app.post('/api/task/run', authRequired, async (req, res) => {
     }
 
     if (!parsedNumbers.length) {
+        const numbersLen =
+            typeof numbers === 'string' ? numbers.length : Array.isArray(numbers) ? numbers.length : 0;
         log(
-            `[task/parse-empty] mode=${mode} user=${req.user.username} ct=${req.headers['content-type'] || '-'} fileContent=${fileContent ? 'yes' : 'no'} numbersType=${Array.isArray(numbers) ? 'array' : typeof numbers} numbersLen=${typeof numbers === 'string' ? numbers.length : Array.isArray(numbers) ? numbers.length : 0}`,
+            `[task/parse-empty] mode=${mode} user=${req.user.username} ct=${req.headers['content-type'] || '-'} fileContent=${fileContent ? 'yes' : 'no'} numbersType=${Array.isArray(numbers) ? 'array' : typeof numbers} numbersLen=${numbersLen}`,
         );
+        if (!fileContent && numbersLen === 0) {
+            res.status(400).json({ ok: false, message: '未接收到文件内容。请刷新页面后重新选择TXT，或先把内容回填到输入框再执行。' });
+            return;
+        }
         res.status(400).json({ ok: false, message: '未能提取到有效电话号码。请确认每行含数字，或直接粘贴号码文本再试。' });
         return;
     }
