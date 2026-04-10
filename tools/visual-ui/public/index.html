@@ -1562,6 +1562,7 @@
                 const failureByReason = (data.diagnostics && data.diagnostics.avatarFetchFailureByReason) || {};
                 const failureByBot = (data.diagnostics && data.diagnostics.avatarFetchFailureByBot) || {};
                 const failureTopErrors = (data.diagnostics && data.diagnostics.avatarFetchFailureTopErrors) || [];
+                const droppedByLengthCount = Number((data.diagnostics && data.diagnostics.droppedByLengthCount) || 0);
                 const reasonLabelMap = {
                     session: '会话/在线',
                     network: '网络超时',
@@ -1602,6 +1603,13 @@
                     metaEl.textContent = metaEl.textContent
                         ? `${metaEl.textContent} ｜ 典型报错：${topErrorItems.join('；')}`
                         : `典型报错：${topErrorItems.join('；')}`;
+                }
+
+                if (droppedByLengthCount > 0) {
+                    metaEl.style.display = 'block';
+                    metaEl.textContent = metaEl.textContent
+                        ? `${metaEl.textContent} ｜ 已忽略疑似非手机号 ${droppedByLengthCount} 条`
+                        : `已忽略疑似非手机号 ${droppedByLengthCount} 条`;
                 }
 
                 // All results are files — build blob URL and show download button

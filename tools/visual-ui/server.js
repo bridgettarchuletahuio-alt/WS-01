@@ -1771,6 +1771,29 @@ const extractPhoneNumbers = (text) => {
     return [...new Set(extractNumbersFromText(text))];
 };
 
+const CHECKNUM_MIN_DIGITS = Number(process.env.CHECKNUM_MIN_DIGITS || 8);
+const CHECKNUM_MAX_DIGITS = Number(process.env.CHECKNUM_MAX_DIGITS || 13);
+
+const sanitizeChecknumNumbers = (numbers = []) => {
+    const accepted = [];
+    const dropped = [];
+
+    for (const item of numbers) {
+        const n = normalizePhoneInput(item);
+        if (!n) continue;
+        if (n.length < CHECKNUM_MIN_DIGITS || n.length > CHECKNUM_MAX_DIGITS) {
+            dropped.push(n);
+            continue;
+        }
+        accepted.push(n);
+    }
+
+    return {
+        accepted: [...new Set(accepted)],
+        dropped: [...new Set(dropped)],
+    };
+};
+
 const extractPhoneNumbersFromBuffer = (buffer) => {
     const decodedTexts = [
         decodeTextBuffer(buffer),
@@ -2901,7 +2924,21 @@ app.post('/api/task/run', authRequired, async (req, res) => {
 
     try {
         if (mode === 'checknum') {
-            const numbers2 = parsedNumbers;
+            const sanitized = sanitizeChecknumNumbers(parsedNumbers);
+            const numbers2 = sanitized.accepted;
+            const droppedByLengthCount = sanitized.dropped.length;
+
+            if (!numbers2.length) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        `未检测到符合规则的手机号（仅允许 ${CHECKNUM_MIN_DIGITS}-${CHECKNUM_MAX_DIGITS} 位数字）。`,
+                    diagnostics: {
+                        submittedCount: parsedNumbers.length,
+                        droppedByLengthCount,
+                    },
+                });
+            }
             const excelRows = [];
             let stoppedEarly = false;
             const dispatch = await dispatchNumbersAcrossClients(
@@ -3011,6 +3048,11 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     topErrorHint +
                     avatarFailureSummary.advice;
             }
+            if (droppedByLengthCount > 0) {
+                diagnosticMessage = diagnosticMessage
+                    ? `${diagnosticMessage} 已忽略 ${droppedByLengthCount} 条疑似非手机号输入。`
+                    : `已忽略 ${droppedByLengthCount} 条疑似非手机号输入。`;
+            }
 
             await addDailyProcessedCount(userId, processedCount);
 
@@ -3046,6 +3088,7 @@ app.post('/api/task/run', authRequired, async (req, res) => {
                     noAvatarCount,
                     avatarFetchFailedCount,
                     avatarCapabilityLimited,
+                    droppedByLengthCount,
                     avatarFetchFailureByReason:
                         avatarFailureSummary.byReason,
                     avatarFetchFailureByBot: avatarFailureSummary.byBot,
